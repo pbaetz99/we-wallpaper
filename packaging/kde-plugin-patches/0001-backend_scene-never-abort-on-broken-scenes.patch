@@ -1,0 +1,74 @@
+diff --git a/src/SceneWallpaper.cpp b/src/SceneWallpaper.cpp
+index e5bfbec..1dc10be 100644
+--- a/src/SceneWallpaper.cpp
++++ b/src/SceneWallpaper.cpp
+@@ -1,3 +1,4 @@
++#include <exception>
+ #include "SceneWallpaper.hpp"
+ #include "SceneWallpaperSurface.hpp"
+ 
+@@ -209,11 +210,24 @@ private:
+     MHANDLER_CMD(SET_SCENE) {
+         if (msg->findObject("scene", &m_scene)) {
+             if (m_rg) m_render->clearLastRenderGraph();
+-            m_rg = sceneToRenderGraph(*m_scene);
+-
+-            if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
+-            m_render->compileRenderGraph(*m_scene, *m_rg);
+-            m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
++            // we-wallpaper: der Render-Graph entsteht auf dem Render-Thread; eine
++            // Ausnahme hier (z.B. std::out_of_range bei unbekannten Render-Targets)
++            // wuerde plasmashell beenden. Stattdessen die Szene verwerfen.
++            try {
++                m_rg = sceneToRenderGraph(*m_scene);
++
++                if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
++                m_render->compileRenderGraph(*m_scene, *m_rg);
++                m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
++            } catch (const std::exception& e) {
++                LOG_ERROR("render graph build failed: %s", e.what());
++                m_rg.reset();
++                m_scene.reset();
++            } catch (...) {
++                LOG_ERROR("render graph build failed: unknown exception");
++                m_rg.reset();
++                m_scene.reset();
++            }
+         }
+     }
+     MHANDLER_CMD(SET_SPEED) { msg->findFloat("value", &m_speed); }
+@@ -445,7 +459,17 @@ void MainHandler::loadScene() {
+             LOG_ERROR("Not supported scene type");
+             return;
+         }
+-        scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager);
++        // we-wallpaper: ein defektes Szenenpaket darf nie plasmashell beenden -
++        // jede Ausnahme des Parsers wird zu "keine Szene" mit Fehlermeldung.
++        try {
++            scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager);
++        } catch (const std::exception& e) {
++            LOG_ERROR("scene parse failed for %s: %s", scene_id.c_str(), e.what());
++            scene = nullptr;
++        } catch (...) {
++            LOG_ERROR("scene parse failed for %s: unknown exception", scene_id.c_str());
++            scene = nullptr;
++        }
+         scene->vfs.swap(pVfs);
+     }
+ 
+diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
+index 487c9f9..8d89f85 100644
+--- a/src/WPSceneParser.cpp
++++ b/src/WPSceneParser.cpp
+@@ -338,6 +338,11 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
+                 svData.renderTargets.push_back({ i, name });
+             } else if (pScene->renderTargets.count(name) == 0) {
+                 LOG_ERROR("%s not found in render targes", name.c_str());
++                // we-wallpaper: unbekanntes Render-Target nicht im Material lassen -
++                // ein leerer Slot wird ueberall uebersprungen, ein fremder Name
++                // fuehrt spaeter zu .at() auf einen fehlenden Schluessel.
++                material.textures.back().clear();
++                continue;
+             } else {
+                 svData.renderTargets.push_back({ i, name });
+                 const auto& rt = pScene->renderTargets.at(name);

@@ -627,8 +627,8 @@ def do_backend(target=None, force=False):
         wtype = wallpaper_type(wid)
         if wtype not in KDE_PLUGIN_SAFE_TYPES and not force and not cfg.get("kde_plugin_allow_scene"):
             print(f"Wallpaper {wid} ({title_of(wid)}) ist vom Typ '{wtype}'. Das Scene-Backend des\n"
-                  "KDE-Plugins hat auf dieser Maschine plasmashell zum Absturz gebracht; das Plugin\n"
-                  "rendert hier zuverlaessig nur video und web.\n"
+                  "KDE-Plugins rendert viele Szenen nicht (unbekannte Render-Targets) und hat\n"
+                  "ungepatcht plasmashell zum Absturz gebracht; zuverlaessig sind video und web.\n"
                   "  Trotzdem versuchen: we-wallpaper backend kde-plugin --force\n"
                   "  Dauerhaft erlauben:  \"kde_plugin_allow_scene\": true in der Config",
                   file=sys.stderr)
@@ -1047,6 +1047,10 @@ def do_doctor():
         "we-wallpaper install-service")
     add(kde_plugin_installed(), "wallpaper-engine-kde-plugin (optional, fuer Desktop-Icons; video/web)",
         f"Optionales Backend; behaelt Desktop-Icons. packaging/build-kde-plugin.sh oder {KDE_PLUGIN_URL}")
+    if kde_plugin_installed():
+        qml_ws = Path("/usr/lib64/qt6/qml/QtWebSockets/qmldir")
+        add(qml_ws.is_file(), "QML-Modul QtWebSockets (das Plugin laedt sonst nicht)",
+            "Fedora/Nobara: dnf install qt6-qtwebsockets-devel - das QML-Modul liegt im -devel-Paket.")
 
     bad = 0
     for ok, text, hint in checks:

@@ -61,12 +61,19 @@ plugin's configuration (`WallpaperSource` in the plugin's packed
 package — the COPR RPM ships only the QML library, and a QML package from a
 different commit renders black.
 
-**Scene wallpapers:** with the plugin's scene backend, a scene wallpaper made
-plasmashell abort on the reference machine (missing render targets in that
-scene). `we-wallpaper backend kde-plugin` therefore refuses scene wallpapers;
-`--force` or `"kde_plugin_allow_scene": true` overrides that at your own risk.
-Use the own renderer for scenes — with **Meta+Shift+W** the icons are one
-keystroke away.
+**Scene wallpapers:** the plugin's scene backend does not render every scene
+(unknown render targets such as `_rt_shadowAtlas`), and unpatched it aborted
+plasmashell with an uncaught `std::out_of_range`. `build-kde-plugin.sh`
+applies `packaging/kde-plugin-patches/` so a broken scene is logged and
+dropped instead of taking the desktop down — verified: same scene, same parser
+errors, plasmashell keeps running. `we-wallpaper backend kde-plugin` still
+refuses scenes by default (`--force` / `"kde_plugin_allow_scene": true`); use
+the own renderer for scenes, **Meta+Shift+W** frees the icons.
+
+**Fedora/Nobara quirk:** the `QtWebSockets` QML module the plugin imports
+lives in `qt6-qtwebsockets-devel`. `dnf remove wallpaper-engine-kde-plugin`
+autoremoves it and the plugin stops loading ("module QtWebSockets is not
+installed") — `we-wallpaper doctor` checks for it.
 
 ## Screenshot
 

@@ -199,12 +199,15 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.m.load_conf().get("backend", "native"), "native")
 
     def test_backend_switch_video_and_back(self):
+        import io, contextlib
         self.fake_plugin(); self.wallpaper("123", "video")
         self.m.save_conf({"screens": {"DP-1": {"id": "123"}}})
-        self.assertEqual(self.m.do_backend("kde-plugin"), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.m.do_backend("kde-plugin"), 0)
         self.assertEqual(self.m.load_conf()["backend"], "kde-plugin")
         self.assertIn('WallpaperSource", "', self.scripts[-1]); self.assertIn("movie.mp4+video", self.scripts[-1])
-        self.assertEqual(self.m.do_backend("native"), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.m.do_backend("native"), 0)
         self.assertEqual(self.m.load_conf()["backend"], "native")
         self.assertIn('"org.kde.image"', self.scripts[-1])
 
@@ -216,10 +219,12 @@ class BackendTests(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(self.m.do_backend("kde-plugin"), 3)
         self.assertIn("scene", err.getvalue()); self.assertEqual(self.scripts, [])
-        self.assertEqual(self.m.do_backend("kde-plugin", force=True), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.m.do_backend("kde-plugin", force=True), 0)
         self.assertIn("scene.json+scene", self.scripts[-1])
         self.m.save_conf({"screens": {"DP-1": {"id": "777"}}, "kde_plugin_allow_scene": True})
-        self.assertEqual(self.m.do_backend("kde-plugin"), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.m.do_backend("kde-plugin"), 0)
 
 
 class PerOutputTests(unittest.TestCase):

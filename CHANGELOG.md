@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] – 2026-09-10
+
+### Added
+- `packaging/kde-plugin-patches/`: the KDE plugin's scene backend no longer
+  terminates plasmashell on a broken scene (try/catch around scene parsing and
+  render-graph construction; unknown render targets are dropped from the
+  material). `build-kde-plugin.sh` applies the patches. Verified with the scene
+  that crashed 0.2.1: same errors logged, plasmashell survives.
+- `doctor` checks the `QtWebSockets` QML module when the plugin is installed.
+
+### Changed
+- `build-kde-plugin.sh` lists `qt6-qtwebsockets-devel` (carries the QML module
+  on Fedora/Nobara) and warns to remove the COPR package with `--noautoremove`.
+
 ## [0.2.1] – 2026-09-10
 
 ### Fixed
