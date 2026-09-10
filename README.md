@@ -61,6 +61,15 @@ plugin's configuration (`WallpaperSource` in the plugin's packed
 package — the COPR RPM ships only the QML library, and a QML package from a
 different commit renders black.
 
+**Upstream status:** both `catsout/wallpaper-engine-kde-plugin` and its scene
+renderer are archived (read-only) since 2026; development moved to
+[waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine),
+which is a standalone Wayland wallpaper daemon — not a Plasma wallpaper plugin,
+so it shares this project's desktop-icon limitation. The plugin patches in
+`packaging/kde-plugin-patches/` therefore cannot go upstream; the same fix
+lives in the fork
+[pbaetz99/wallpaper-scene-renderer](https://github.com/pbaetz99/wallpaper-scene-renderer/tree/fix/no-terminate-on-broken-scene).
+
 **Scene wallpapers:** the plugin's scene backend does not render every scene
 (unknown render targets such as `_rt_shadowAtlas`), and unpatched it aborted
 plasmashell with an uncaught `std::out_of_range`. `build-kde-plugin.sh`
