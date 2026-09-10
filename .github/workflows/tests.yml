@@ -1,0 +1,27 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PySide6 and offscreen deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+          python -m pip install --quiet PySide6
+      - name: Run test suite
+        run: tests/run.sh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          WE_LANG: de
+      - name: Syntax check of all scripts
+        run: |
+          for f in bin/* contrib/we-ambient-guard; do python -c "import ast,sys; ast.parse(open('$f').read())" && echo "ok $f"; done
+          bash -n install.sh tests/run.sh

@@ -3,3 +3,4 @@ __pycache__/
 *.png
 *.log
 /dist/
+!docs/images/*.png

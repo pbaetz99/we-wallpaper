@@ -26,8 +26,11 @@ from PySide6.QtDBus import QDBusConnection, QDBusConnectionInterface, QDBusInter
 HOME = Path.home()
 STATE = HOME / ".local/state"
 PIDFILE = STATE / "we-wallpaper.pid"
+OUTPUTS_FILE = STATE / "we-wallpaper-outputs.json"
 SELFPID = STATE / "we-wallpaper-watch.pid"
-SCRIPT = HOME / ".local/share/we-wallpaper/fullscreen-watch.js"
+SCRIPT = next((p for p in (HOME / ".local/share/we-wallpaper/fullscreen-watch.js",
+                            Path("/usr/share/we-wallpaper/fullscreen-watch.js")) if p.is_file()),
+              HOME / ".local/share/we-wallpaper/fullscreen-watch.js")
 SCRIPT_NAME = "we-wallpaper-fullscreen-watch"
 SERVICE = "org.wewallpaper.Watch"
 WATCHDOG_MS = 5000
@@ -55,6 +58,76 @@ def renderer_pid():
         return pid
     except (OSError, ValueError):
         return None
+
+
+def stray_renderers():
+    """Alle lebenden Renderer-Prozesse ueber /proc/<pid>/exe."""
+    try:
+        import json as _j
+        cfg = _j.loads(CONF.read_text(encoding="utf-8")) if CONF.is_file() else {}
+    except Exception:
+        cfg = {}
+    binp = os.environ.get("WE_RENDERER") or cfg.get("renderer") or \
+        str(HOME / ".local/src/linux-wallpaperengine/build/output/linux-wallpaperengine")
+    try:
+        target = Path(binp).expanduser().resolve()
+    except OSError:
+        return []
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "exe")).resolve() == target:
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def renderer_map():
+    """{pid: [Monitore]} aller lebenden Renderer. Ohne Zuordnungsdatei gilt der
+    eine Renderer aus der PID-Datei fuer alle Monitore ("*")."""
+    out = {}
+    try:
+        data = json.loads(OUTPUTS_FILE.read_text())
+        for pid, outs in data.items():
+            pid = int(pid)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            out[pid] = list(outs) or ["*"]
+    except Exception:
+        pass
+    if not out:
+        pid = renderer_pid()
+        if pid:
+            out[pid] = ["*"]
+    return out
+
+
+def decide(mapping, global_reasons, per_output_reasons):
+    """Reine Entscheidungsfunktion: welche PIDs sollen eingefroren sein?
+
+    mapping: {pid: [Monitore]}; global_reasons: Liste von Gruenden, die fuer
+    alle gelten; per_output_reasons: {Monitor: [Gruende]}. Ein Prozess wird
+    eingefroren, wenn ein globaler Grund vorliegt oder JEDER seiner Monitore
+    einen eigenen Grund hat ("*" = alle Monitore -> alle bekannten muessen
+    betroffen sein).
+    """
+    result = {}
+    known = [m for m in per_output_reasons.keys()]
+    for pid, outs in mapping.items():
+        if global_reasons:
+            result[pid] = global_reasons[0]
+            continue
+        targets = known if outs == ["*"] else outs
+        if targets and all(per_output_reasons.get(o) for o in targets):
+            result[pid] = per_output_reasons[targets[0]][0]
+        else:
+            result[pid] = None
+    return result
 
 
 def proc_state(pid):
@@ -125,6 +198,9 @@ class Watch(QObject):
         self.fullscreen = False
         self.locked = False
         self.covered = False
+        self.fullscreen_outputs = set()   # Monitore mit Vollbildfenster
+        self.covered_outputs = set()      # Monitore, die maximiert verdeckt sind
+        self.all_outputs = set()          # vom KWin-Skript gemeldete Monitore
         self.frozen_pid = None
         self.manual_pause = False   # per Tastenkuerzel eingefroren
 
@@ -135,38 +211,77 @@ class Watch(QObject):
         except OSError:
             pass
 
-    def pause_reason(self):
-        """Erster zutreffender Grund oder None. Reihenfolge = Prioritaet."""
+    def reasons(self):
+        """(globale Gruende, {Monitor: [Gruende]}) nach Konfiguration."""
+        glob = []
         if self.manual_pause:
-            return "Handpause"
-        if self.fullscreen and conf_flag("pause_on_fullscreen"):
-            return "Vollbild"
+            glob.append("Handpause")
         if self.locked and conf_flag("pause_on_lock"):
-            return "Bildschirm gesperrt"
-        if self.covered and conf_flag("pause_on_maximized"):
-            return "Fenster maximiert"
-        return None
+            glob.append("Bildschirm gesperrt")
+        per = {o: [] for o in self.all_outputs}
+        if conf_flag("pause_on_fullscreen"):
+            for o in self.fullscreen_outputs:
+                per.setdefault(o, []).append("Vollbild")
+        if conf_flag("pause_on_maximized"):
+            for o in self.covered_outputs:
+                per.setdefault(o, []).append("Fenster maximiert")
+        # Kompatibilitaet: alte boolesche Meldungen ohne Monitorliste
+        if not self.all_outputs:
+            if self.fullscreen and conf_flag("pause_on_fullscreen"):
+                glob.append("Vollbild")
+            if self.covered and conf_flag("pause_on_maximized"):
+                glob.append("Fenster maximiert")
+        return glob, per
+
+    def pause_reason(self):
+        """Grund fuer den ersten Renderer (fuer Log/Status) oder None."""
+        glob, per = self.reasons()
+        d = decide(renderer_map(), glob, per)
+        return next((r for r in d.values() if r), None)
 
     def apply(self):
-        """Bringt den Renderer in den Zustand, den die Gruende verlangen."""
-        pid = renderer_pid()
-        if pid is None:
+        """Bringt jeden Renderer in den Zustand, den die Gruende verlangen."""
+        mapping = renderer_map()
+        if not mapping:
             self.frozen_pid = None
             return
-        reason = self.pause_reason()
-        state = proc_state(pid)
-        if reason and state != "T":
-            try:
-                os.kill(pid, signal.SIGSTOP)
-                self.frozen_pid = pid
-                self._write_pause(reason)
-                log(f"{reason} -> Renderer {pid} eingefroren")
-            except OSError as e:
-                log(f"SIGSTOP fehlgeschlagen: {e}")
-        elif not reason and state == "T":
-            if thaw(pid, "Grund entfallen"):
-                self.frozen_pid = None
-                self._write_pause(None)
+        glob, per = self.reasons()
+        wanted = decide(mapping, glob, per)
+        any_frozen = None
+        for pid, reason in wanted.items():
+            state = proc_state(pid)
+            outs = ",".join(mapping[pid])
+            if reason and state != "T":
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                    log(f"{reason} -> Renderer {pid} ({outs}) eingefroren")
+                except OSError as e:
+                    log(f"SIGSTOP fehlgeschlagen: {e}")
+            elif not reason and state == "T":
+                thaw(pid, f"Grund entfallen ({outs})")
+            if reason:
+                any_frozen = reason
+        self.frozen_pid = next((p for p, r in wanted.items() if r), None)
+        self._write_pause(any_frozen)
+
+    @Slot(str)
+    def setFullscreenOutputs(self, csv):
+        """Vom KWin-Skript: Monitore mit Vollbildfenster, kommagetrennt."""
+        self.fullscreen_outputs = {x for x in csv.split(",") if x}
+        self.fullscreen = bool(self.fullscreen_outputs)
+        self.apply()
+
+    @Slot(str)
+    def setCoveredOutputs(self, csv):
+        self.covered_outputs = {x for x in csv.split(",") if x}
+        self.covered = bool(self.covered_outputs)
+        self.apply()
+
+    @Slot(str)
+    def setOutputs(self, csv):
+        """Vom KWin-Skript: alle eingeschalteten Monitore."""
+        self.all_outputs = {x for x in csv.split(",") if x}
+        self.apply()
 
     @Slot(bool)
     def setFullscreen(self, active):
@@ -233,19 +348,26 @@ class Watch(QObject):
         if pid is None:
             self.frozen_pid = None
             return
-        if self.pause_reason() is None and proc_state(pid) == "T":
-            thaw(pid, "Wachhund: kein Grund mehr, Renderer stand aber")
-            self.frozen_pid = None
-            self._write_pause(None)
-        elif self.pause_reason() and proc_state(pid) != "T":
-            self.apply()          # z.B. nach einem Renderer-Neustart
-        if self.frozen_pid and self.frozen_pid != pid:
-            thaw(self.frozen_pid, "Wachhund: alter Renderer noch angehalten")
-            self.frozen_pid = pid if self.fullscreen else None
+        glob, per = self.reasons()
+        wanted = decide(renderer_map(), glob, per)
+        for p, reason in wanted.items():
+            st = proc_state(p)
+            if reason is None and st == "T":
+                thaw(p, "Wachhund: kein Grund mehr, Renderer stand aber")
+            elif reason and st != "T":
+                self.apply()      # z.B. nach einem Renderer-Neustart
+                break
+        # Veraltete Prozesse: eingefroren, aber in keiner aktuellen Zuordnung
+        # mehr (z.B. nach einem Neustart des Renderers). Bewusst NICHT "alles
+        # ausser der PID-Datei" - im per_output-Modus gibt es mehrere gueltige.
+        current = set(renderer_map())
+        for p in stray_renderers():
+            if p not in current and proc_state(p) == "T":
+                thaw(p, "Wachhund: verwaister Renderer stand noch")
 
     def shutdown(self):
         self.manual_pause = False
-        for pid in {self.frozen_pid, renderer_pid()}:
+        for pid in set(renderer_map()) | {self.frozen_pid, renderer_pid()}:
             thaw(pid, "Watcher beendet")
         self.frozen_pid = None
 

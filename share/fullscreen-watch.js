@@ -24,6 +24,32 @@ function evaluate() {
         lastState = any;
         callDBus(SERVICE, PATH, IFACE, "setFullscreen", any);
     }
+    // je Monitor: welche Ausgaenge haben ein Vollbildfenster?
+    var fsOuts = {};
+    for (var k = 0; k < list.length; k++) {
+        var fw = list[k];
+        if (!fw || fw.fullScreen !== true || fw.minimized === true) { continue; }
+        try { if (fw.output && fw.output.name) { fsOuts[fw.output.name] = true; } } catch (e) {}
+    }
+    var fsList = Object.keys(fsOuts).sort().join(",");
+    if (fsList !== lastFsList) {
+        lastFsList = fsList;
+        callDBus(SERVICE, PATH, IFACE, "setFullscreenOutputs", fsList);
+    }
+    reportOutputs();
+}
+
+var lastFsList = null;
+var lastOutputs = null;
+function reportOutputs() {
+    var outs = workspace.screens || [];
+    var names = [];
+    for (var i = 0; i < outs.length; i++) { if (outs[i] && outs[i].name) { names.push(outs[i].name); } }
+    var csv = names.sort().join(",");
+    if (csv !== lastOutputs) {
+        lastOutputs = csv;
+        callDBus(SERVICE, PATH, IFACE, "setOutputs", csv);
+    }
 }
 
 function hook(w) {
@@ -94,23 +120,31 @@ function covers(w, out) {
 }
 
 var lastCovered = null;
+var lastCoveredList = null;
 
 function evaluateCovered() {
     var outs = workspace.screens || [];
     if (!outs.length) { return; }
     var wins = windowList();
     var all = true;
+    var coveredNames = [];
     for (var o = 0; o < outs.length; o++) {
         var hit = false;
         for (var i = 0; i < wins.length; i++) {
             if (covers(wins[i], outs[o])) { hit = true; break; }
         }
-        if (!hit) { all = false; break; }
+        if (hit) { coveredNames.push(outs[o].name); } else { all = false; }
     }
     if (all !== lastCovered) {
         lastCovered = all;
         callDBus(SERVICE, PATH, IFACE, "setCovered", all);
     }
+    var csv = coveredNames.sort().join(",");
+    if (csv !== lastCoveredList) {
+        lastCoveredList = csv;
+        callDBus(SERVICE, PATH, IFACE, "setCoveredOutputs", csv);
+    }
+    reportOutputs();
 }
 
 function hookCovered(w) {

@@ -25,6 +25,7 @@ LEGACY = HOME / ".config/we-wallpaper.conf"
 STATE = HOME / ".local/state"
 LOG = STATE / "we-wallpaper.log"
 PIDFILE = STATE / "we-wallpaper.pid"
+OUTPUTS_FILE = STATE / "we-wallpaper-outputs.json"   # {Prozess-PID: [Monitore]}
 ROTPID = STATE / "we-wallpaper-rotate.pid"
 WATCHPID = STATE / "we-wallpaper-watch.pid"
 WATCHER = HOME / ".local/bin/we-wallpaper-watch"
@@ -49,6 +50,9 @@ DEFAULTS = {
     "pause_on_maximized": True,    # alle Monitore von maximierten Fenstern verdeckt
     "rotation": {"enabled": False, "minutes": 30, "pool": [],
                  "order": "random", "index": 0},
+    "renderer": "",         # Pfad zum linux-wallpaperengine-Binary; leer = Standard
+    "backend": "native",    # native = linux-wallpaperengine | kde-plugin = wallpaper-engine-kde-plugin
+    "per_output": False,    # ein Renderer-Prozess je Monitor -> Pausieren pro Monitor moeglich
     "layer": "background",  # wlr-layer-shell-Ebene: background|bottom|top|overlay
                             # 'bottom' verdeckt auf Plasma die Desktop-Icons
     "spans": [],           # [{outputs:[...], id, scaling, clamp, properties}]
@@ -77,7 +81,23 @@ def migrate_legacy():
     return cfg
 
 
+def apply_renderer_override(cfg):
+    """Renderer-Pfad: WE_RENDERER > Config "renderer" > Standard."""
+    global BIN
+    if os.environ.get("WE_RENDERER"):
+        return
+    custom = (cfg or {}).get("renderer") or ""
+    if custom:
+        BIN = Path(custom).expanduser()
+
+
 def load_conf():
+    cfg = _load_conf_raw()
+    apply_renderer_override(cfg)
+    return cfg
+
+
+def _load_conf_raw():
     if CONF.is_file():
         try:
             cfg = dict(DEFAULTS)
@@ -152,21 +172,29 @@ def proc_state(pid):
         return None
 
 
+def unit_active(unit):
+    r = systemctl("is-active", unit)
+    return bool(r and r.stdout.strip() == "active")
+
+
+
+
 def rescue_frozen():
-    """Weckt einen eingefrorenen Renderer auf, wenn kein Watcher mehr lebt.
+    """Weckt eingefrorene Renderer auf, wenn kein Watcher mehr lebt.
     Faengt den Fall ab, dass der Watcher hart abgeschossen wurde."""
-    pid = read_pid(PIDFILE)
-    if pid is None or proc_state(pid) != "T":
+    frozen = [p for p in stray_pids() if proc_state(p) == "T"]
+    if not frozen:
         return False
-    if read_pid(WATCHPID):
+    if read_pid(WATCHPID) or (service_enabled() and unit_active(UNIT_WATCH)):
         return False        # Watcher lebt, der regelt das selbst
-    try:
-        os.kill(pid, signal.SIGCONT)
-        print(f"  Renderer {pid} war eingefroren und wurde befreit "
-              f"(kein Watcher aktiv)")
-        return True
-    except OSError:
-        return False
+    for pid in frozen:
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except OSError:
+            pass
+    print(f"  Renderer {', '.join(map(str, frozen))} war(en) eingefroren und "
+          f"wurde(n) befreit (kein Watcher aktiv)")
+    return True
 
 
 def read_pid(path):
@@ -190,6 +218,40 @@ def _bg_block(target_flag, target_value, sc):
     for pname, pval in (sc.get("properties") or {}).items():
         block += ["--set-property", f"{pname}={pval}"]
     return block
+
+
+def build_arg_groups(cfg):
+    """Wie build_args, aber je Renderer-Prozess getrennt.
+
+    Ergebnis: (groups, skipped) mit groups = [(monitorliste, args)]. Im
+    Standardmodus ist das genau eine Gruppe mit allen Monitoren; bei
+    per_output eine Gruppe je Monitor (Spans bleiben je ein Prozess), damit der
+    Watcher einzelne Monitore einfrieren kann.
+    """
+    args, skipped = build_args(cfg)
+    if not args:
+        return [], skipped
+    tail_start = None
+    for i, a in enumerate(args):
+        if a == "--layer" or a == "--fps":
+            tail_start = i
+            break
+    tail = args[tail_start:] if tail_start is not None else []
+    head = args[:tail_start] if tail_start is not None else args
+    # head in Bloecke je --screen-root/--screen-span zerlegen
+    blocks, cur, outs = [], [], []
+    for i, a in enumerate(head):
+        if a in ("--screen-root", "--screen-span") and cur:
+            blocks.append((outs, cur)); cur, outs = [], []
+        if a in ("--screen-root", "--screen-span"):
+            outs = head[i + 1].split(",")
+        cur.append(a)
+    if cur:
+        blocks.append((outs, cur))
+    if not cfg.get("per_output"):
+        all_outs = [o for outs_, _ in blocks for o in outs_]
+        return [(all_outs, head + tail)], skipped
+    return [(outs_, blk + tail) for outs_, blk in blocks], skipped
 
 
 def build_args(cfg):
@@ -265,7 +327,7 @@ After=plasma-core.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/we-wallpaper run-renderer
+ExecStart=@BINDIR@/we-wallpaper run-renderer
 Restart=on-failure
 RestartSec=5
 # Beim Stoppen zuverlaessig auch eingefrorene Prozesse einsammeln
@@ -288,7 +350,7 @@ After=we-wallpaper.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/we-wallpaper-watch
+ExecStart=@BINDIR@/we-wallpaper-watch
 Restart=on-failure
 RestartSec=5
 
@@ -316,8 +378,11 @@ def service_enabled():
 
 def do_install_service():
     UNITDIR.mkdir(parents=True, exist_ok=True)
-    (UNITDIR / UNIT_RENDER).write_text(RENDER_UNIT_TEXT, encoding="utf-8")
-    (UNITDIR / UNIT_WATCH).write_text(WATCH_UNIT_TEXT, encoding="utf-8")
+    # Units zeigen auf das Verzeichnis, aus dem dieses Skript laeuft - so
+    # funktionieren ~/.local/bin (install.sh) und /usr/bin (RPM) gleichermassen.
+    bindir = str(Path(sys.argv[0]).resolve().parent)
+    (UNITDIR / UNIT_RENDER).write_text(RENDER_UNIT_TEXT.replace("@BINDIR@", bindir), encoding="utf-8")
+    (UNITDIR / UNIT_WATCH).write_text(WATCH_UNIT_TEXT.replace("@BINDIR@", bindir), encoding="utf-8")
     systemctl("daemon-reload")
     # Der Autostart-Eintrag wuerde sonst doppelt starten
     auto = HOME / ".config/autostart/we-wallpaper.desktop"
@@ -347,15 +412,216 @@ def do_run_renderer():
     """Vordergrundmodus fuer systemd: ersetzt den eigenen Prozess durch den
     Renderer, damit systemd ihn direkt ueberwacht und neu starten kann."""
     cfg = load_conf()
+    if (cfg.get("backend") or "native") != "native":
+        print("Backend ist das KDE-Plugin - eigener Renderer bleibt aus", file=sys.stderr)
+        return 0
     args, skipped = build_args(cfg)
     for item in skipped:
         print(f"uebersprungen: {item}", file=sys.stderr)
     if not args:
         print("kein nutzbarer Monitor konfiguriert", file=sys.stderr)
         return 1
+    groups, _ = build_arg_groups(cfg)
     STATE.mkdir(parents=True, exist_ok=True)
-    PIDFILE.write_text(str(os.getpid()))   # execv behaelt die PID
-    os.execv(str(BIN), [str(BIN)] + args)
+    if len(groups) == 1:
+        PIDFILE.write_text(str(os.getpid()))   # execv behaelt die PID
+        write_outputs_map({os.getpid(): groups[0][0]})
+        os.execv(str(BIN), [str(BIN)] + args)
+    # per_output: dieser Prozess bleibt als Aufseher, startet je Monitor einen
+    # Renderer, startet abgestuerzte neu und gibt SIGTERM an alle weiter.
+    children = {}
+
+    def start(outs, gargs):
+        p = subprocess.Popen([str(BIN)] + gargs, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        children[p.pid] = (p, outs, gargs)
+        write_outputs_map({pid: c[1] for pid, c in children.items()})
+        return p
+
+    stopping = {"flag": False}
+
+    def on_term(*_):
+        stopping["flag"] = True
+        for pid, (p, _o, _a) in list(children.items()):
+            try:
+                os.kill(pid, signal.SIGCONT)
+                p.terminate()
+            except OSError:
+                pass
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    for outs, gargs in groups:
+        start(outs, gargs)
+    PIDFILE.write_text(str(next(iter(children))))
+    while children and not stopping["flag"]:
+        pid, status = os.wait()
+        if pid in children and not stopping["flag"]:
+            _p, outs, gargs = children.pop(pid)
+            print(f"Renderer fuer {','.join(outs)} beendet ({status}) - Neustart in 3s",
+                  file=sys.stderr)
+            time.sleep(3)
+            start(outs, gargs)
+            PIDFILE.write_text(str(next(iter(children))))
+    for pid, (p, _o, _a) in list(children.items()):
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+    OUTPUTS_FILE.unlink(missing_ok=True)
+    return 0
+
+
+# ---------------------------------------------------------------- Backend: KDE-Plugin
+# Alternative zum eigenen Renderer: das wallpaper-engine-kde-plugin (catsout)
+# rendert INNERHALB von Plasmas Wallpaper-Ebene - Desktop-Icons bleiben sichtbar.
+# Umgeschaltet wird ueber Plasmas Scripting-Schnittstelle (org.kde.PlasmaShell
+# evaluateScript), die das Wallpaper-Plugin jedes Desktops und dessen Config
+# setzen kann. Der eigene Renderer wird dabei gestoppt.
+KDE_PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"
+KDE_PLUGIN_URL = "https://github.com/catsout/wallpaper-engine-kde-plugin"
+STEAM_LIB = HOME / ".local/share/Steam"
+
+
+def kde_plugin_dir():
+    """Verzeichnis des installierten Plugins - gesucht unter allen Orten, an
+    denen Plasma Wallpaper-Plugins laedt (Distributionspakete legen es nach
+    /usr/share/plasma/wallpapers, manuelle Installationen nach ~/.local/share)."""
+    roots = [HOME / ".local/share/plasma/wallpapers", Path("/usr/share/plasma/wallpapers"),
+             Path("/usr/local/share/plasma/wallpapers")]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and "wallpaperenginekde" in d.name.lower() and (d / "metadata.json").is_file():
+                return d
+    return None
+
+
+def kde_plugin_installed():
+    return kde_plugin_dir() is not None
+
+
+def kde_plugin_id():
+    d = kde_plugin_dir()
+    if d:
+        try:
+            return json.loads((d / "metadata.json").read_text(encoding="utf-8"))["KPlugin"]["Id"]
+        except Exception:
+            return d.name
+    return KDE_PLUGIN_ID
+
+
+def plasma_script(js):
+    """Fuehrt ein Plasma-Skript aus; gibt dessen print()-Ausgabe zurueck."""
+    r = subprocess.run(["busctl", "--user", "call", "org.kde.plasmashell", "/PlasmaShell",
+                        "org.kde.PlasmaShell", "evaluateScript", "s", js],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "evaluateScript fehlgeschlagen")
+    out = r.stdout.strip()
+    # busctl liefert: s "text"
+    return json.loads(out[2:]) if out.startswith("s ") else out
+
+
+def _js_str(v):
+    return json.dumps(str(v))
+
+
+def current_wallpaper_plugins():
+    """{Connector-Name oder Screen-Index: Plugin-ID} aller Desktops."""
+    js = (
+        'var out = {}; var ds = desktops();'
+        'for (var i = 0; i < ds.length; i++) { var d = ds[i]; if (d.screen < 0) continue;'
+        '  var name = String(d.screen);'
+        '  try { if (typeof screenGeometry === "function") { name = String(d.screen); } } catch (e) {}'
+        '  out[name] = d.wallpaperPlugin; }'
+        'print(JSON.stringify(out));')
+    try:
+        return json.loads(plasma_script(js) or "{}")
+    except Exception:
+        return {}
+
+
+def build_kde_plugin_script(cfg, wallpaper_id):
+    """Plasma-Skript, das das KDE-Plugin aktiviert und konfiguriert."""
+    pid = kde_plugin_id()
+    ws = str(WORKSHOP / wallpaper_id)
+    return (
+        'var ds = desktops();'
+        'for (var i = 0; i < ds.length; i++) {'
+        '  var d = ds[i]; if (d.screen < 0) continue;'
+        f'  d.wallpaperPlugin = {_js_str(pid)};'
+        f'  d.currentConfigGroup = ["Wallpaper", {_js_str(pid)}, "General"];'
+        f'  d.writeConfig("SteamLibraryPath", {_js_str("file://" + str(STEAM_LIB))});'
+        f'  d.writeConfig("WallpaperWorkShopId", {_js_str(wallpaper_id)});'
+        f'  d.writeConfig("WallpaperSource", {_js_str("file://" + ws)});'
+        f'  d.writeConfig("Fps", {int(cfg.get("fps", 30))});'
+        f'  d.writeConfig("Volume", {int(cfg.get("volume", 15))});'
+        f'  d.writeConfig("MuteAudio", {"true" if cfg.get("silent") else "false"});'
+        f'  d.writeConfig("MouseInput", {"false" if cfg.get("disable_mouse") else "true"});'
+        '  d.writeConfig("PauseMode", 0);'
+        '}'
+        f'print("ok:" + ds.length);'
+    )
+
+
+def build_native_restore_script():
+    return (
+        'var ds = desktops(); var n = 0;'
+        'for (var i = 0; i < ds.length; i++) { var d = ds[i]; if (d.screen < 0) continue;'
+        '  if (d.wallpaperPlugin === ' + _js_str(kde_plugin_id()) + ') { d.wallpaperPlugin = "org.kde.image"; n++; } }'
+        'print("restored:" + n);')
+
+
+def do_backend(target=None):
+    cfg = load_conf()
+    if target is None:
+        cur = cfg.get("backend") or "native"
+        print(f"aktiv: {cur}")
+        print(f"KDE-Plugin installiert: {'ja' if kde_plugin_installed() else 'nein'}")
+        plugs = current_wallpaper_plugins()
+        if plugs:
+            print("Plasma-Wallpaper-Plugins: " + ", ".join(f"{k}={v}" for k, v in plugs.items()))
+        return 0
+    if target not in ("native", "kde-plugin"):
+        print("Aufruf: we-wallpaper backend [native|kde-plugin]", file=sys.stderr)
+        return 1
+    if target == "kde-plugin":
+        if not kde_plugin_installed():
+            print("wallpaper-engine-kde-plugin ist nicht installiert.\n"
+                  f"  Quelle: {KDE_PLUGIN_URL}\n"
+                  "  Fedora/Nobara: COPR kylegospo/wallpaper-engine-kde-plugin",
+                  file=sys.stderr)
+            return 2
+        screens = cfg.get("screens") or {}
+        wid = next((str(sc.get("id")) for _n, sc in sorted(screens.items()) if sc.get("id")), "")
+        if not wid.isdigit():
+            print("kein Wallpaper zugewiesen - erst in der GUI zuweisen", file=sys.stderr)
+            return 1
+        do_stop(quiet=True)
+        if service_enabled():
+            systemctl("disable", "--now", UNIT_RENDER, UNIT_WATCH)
+        out = plasma_script(build_kde_plugin_script(cfg, wid))
+        cfg["backend"] = "kde-plugin"
+        save_conf(cfg)
+        print(f"KDE-Plugin aktiv mit Wallpaper {wid} ({title_of(wid)}) - Plasma: {out}")
+        return 0
+    # zurueck auf den eigenen Renderer
+    try:
+        out = plasma_script(build_native_restore_script())
+    except Exception as e:
+        out = f"Plasma nicht erreichbar: {e}"
+    cfg["backend"] = "native"
+    save_conf(cfg)
+    if service_installed():
+        systemctl("enable", "--now", UNIT_RENDER, UNIT_WATCH)
+        time.sleep(5)
+    else:
+        spawn(cfg)
+        time.sleep(4)
+    print(f"eigener Renderer aktiv - Plasma: {out}")
+    return do_status()
 
 
 # ---------------------------------------------------------------- Aktionen
@@ -434,18 +700,27 @@ def do_stop(quiet=False):
     return was or bool(strays)
 
 
+def write_outputs_map(mapping):
+    STATE.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_FILE.write_text(json.dumps({str(k): v for k, v in mapping.items()}))
+
+
 def spawn(cfg):
-    args, skipped = build_args(cfg)
+    groups, skipped = build_arg_groups(cfg)
     for s in skipped:
         print(f"uebersprungen: {s}", file=sys.stderr)
-    if not args:
+    if not groups:
         print("kein nutzbarer Monitor konfiguriert - nichts gestartet")
         return False
     STATE.mkdir(parents=True, exist_ok=True)
+    mapping = {}
     with open(LOG, "w") as log:
-        p = subprocess.Popen([str(BIN)] + args, stdout=log, stderr=log,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
-    PIDFILE.write_text(str(p.pid))
+        for outs, args in groups:
+            p = subprocess.Popen([str(BIN)] + args, stdout=log, stderr=log,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            mapping[p.pid] = outs
+    PIDFILE.write_text(str(next(iter(mapping))))
+    write_outputs_map(mapping)
     return True
 
 
@@ -532,11 +807,6 @@ def do_profile(name):
     save_conf(cfg)
     print(f"Profil {name!r} aktiviert")
     return do_start()
-
-
-def unit_active(unit):
-    r = systemctl("is-active", unit)
-    return bool(r and r.stdout.strip() == "active")
 
 
 def watch_active():
@@ -645,7 +915,10 @@ def do_status():
         if service_enabled():
             extra += ", als systemd-Dienst"
         frozen = ""
-        if proc_state(pid) == "T":
+        allp = stray_pids()
+        if len(allp) > 1:
+            extra += f", {len(allp)} Renderer-Prozesse"
+        if any(proc_state(p) == "T" for p in allp) or proc_state(pid) == "T":
             reason = "?"
             try:
                 reason = json.loads((STATE / "we-wallpaper-pause.json").read_text()).get("reason") or "?"
@@ -684,8 +957,81 @@ def do_list():
     return 0
 
 
+def do_doctor():
+    """Prueft alle Voraussetzungen und sagt konkret, was fehlt."""
+    import shutil
+    cfg = load_conf()
+    checks = []
+
+    def add(ok, text, hint=""):
+        checks.append((ok, text, hint))
+
+    add(os.environ.get("XDG_SESSION_TYPE") == "wayland",
+        f"Wayland-Sitzung (XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE', '?')})",
+        "Der Renderer braucht unter Plasma eine Wayland-Sitzung (Layer-Shell).")
+    add("KDE" in os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        f"KDE Plasma (XDG_CURRENT_DESKTOP={os.environ.get('XDG_CURRENT_DESKTOP', '?')})",
+        "Vollbild-/Maximiert-Erkennung und Tastenkuerzel nutzen KWin-Scripting.")
+    add(BIN.is_file() and os.access(BIN, os.X_OK),
+        f"Renderer: {BIN}",
+        "linux-wallpaperengine bauen (siehe README) oder Pfad per WE_RENDERER / "
+        "Config-Schluessel \"renderer\" setzen.")
+    assets = HOME / ".local/share/Steam/steamapps/common/wallpaper_engine/assets"
+    add(assets.is_dir(), f"Wallpaper-Engine-Assets: {assets}",
+        "Wallpaper Engine in Steam installieren (Proton, 'Steam Play fuer alle Titel').")
+    n_items = len([d for d in WORKSHOP.iterdir() if (d / "project.json").is_file()]) \
+        if WORKSHOP.is_dir() else 0
+    add(n_items > 0, f"Workshop-Wallpaper: {n_items} in {WORKSHOP}",
+        "Im Steam-Workshop Wallpaper abonnieren; Steam laedt sie in diesen Ordner.")
+    try:
+        import PySide6  # noqa: F401
+        from PySide6 import QtDBus  # noqa: F401
+        add(True, f"PySide6 {PySide6.__version__} inkl. QtDBus")
+    except Exception as e:
+        add(False, "PySide6 mit QtDBus", f"Fedora: dnf install python3-pyside6 ({e})")
+    add(shutil.which("kscreen-doctor") is not None, "kscreen-doctor",
+        "Teil von KDE (libkscreen); ohne ihn fehlt die Monitorerkennung.")
+    add(shutil.which("ffprobe") is not None, "ffprobe (optional, Videoaufloesung)",
+        "ffmpeg installieren, sonst zeigt die GUI keine Aufloesungen.")
+    r = subprocess.run(["busctl", "--user", "call", "org.kde.KWin", "/Scripting",
+                        "org.kde.kwin.Scripting", "isScriptLoaded", "s", "we-doctor"],
+                       capture_output=True, text=True, timeout=10)
+    add(r.returncode == 0, "KWin-Scripting per D-Bus erreichbar",
+        "Ohne KWin-Scripting keine Vollbild-Pause und keine Tastenkuerzel.")
+    r = systemctl("is-system-running")
+    add(r is not None and r.returncode in (0, 1), "systemd --user verfuegbar",
+        "Ohne User-systemd laufen nur Autostart-Eintrag und manueller Start.")
+    add(str(HOME / ".local/bin") in os.environ.get("PATH", "").split(":"),
+        "~/.local/bin im PATH",
+        "Sonst Befehle mit vollem Pfad aufrufen oder PATH ergaenzen.")
+    add(CONF.is_file(), f"Konfiguration: {CONF}",
+        "Entsteht beim ersten 'Anwenden' in der GUI oder beim ersten Start.")
+    screens = cfg.get("screens") or {}
+    add(bool(screens), f"zugewiesene Monitore: {', '.join(sorted(screens)) or 'keine'}",
+        "In der GUI ein Wallpaper einem Monitor zuweisen und 'Anwenden'.")
+    add(service_enabled(), "als systemd-Dienst eingerichtet (empfohlen)",
+        "we-wallpaper install-service")
+    add(kde_plugin_installed(), "wallpaper-engine-kde-plugin (optional, fuer Desktop-Icons)",
+        f"Optionales Backend; behaelt Desktop-Icons. {KDE_PLUGIN_URL}")
+
+    bad = 0
+    for ok, text, hint in checks:
+        print(f"  {'OK ' if ok else 'FEHLT'}  {text}")
+        if not ok:
+            bad += 1
+            if hint:
+                print(f"         -> {hint}")
+    print(f"\n{len(checks) - bad} von {len(checks)} Pruefungen bestanden.")
+    return 1 if bad else 0
+
+
 def main():
+    load_conf()   # setzt u.a. den Renderer-Pfad fuer alle Aktionen
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action == "doctor":
+        return do_doctor()
+    if action == "backend":
+        return do_backend(sys.argv[2] if len(sys.argv) > 2 else None)
     if action == "start":
         return do_start()
     if action == "restart":
@@ -717,14 +1063,12 @@ def main():
     if action == "next":
         return do_next()
     if action == "thaw":
-        pid = read_pid(PIDFILE)
-        if pid and proc_state(pid) == "T":
+        frozen = [p for p in stray_pids() if proc_state(p) == "T"]
+        for pid in frozen:
             os.kill(pid, signal.SIGCONT)
-            print(f"Renderer {pid} aufgeweckt")
-        else:
-            print("nichts eingefroren")
+        print(f"Renderer {', '.join(map(str, frozen))} aufgeweckt" if frozen else "nichts eingefroren")
         return 0
-    print("Aufruf: we-wallpaper start|stop|restart|status|list|thaw|profile|profiles"
+    print("Aufruf: we-wallpaper doctor|backend|start|stop|restart|status|list|thaw|profile|profiles"
           "|next|toggle|install-service|uninstall-service",
           file=sys.stderr)
     return 1

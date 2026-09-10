@@ -1,5 +1,7 @@
 # we-wallpaper
 
+[![tests](https://github.com/pbaetz99/we-wallpaper/actions/workflows/tests.yml/badge.svg)](https://github.com/pbaetz99/we-wallpaper/actions/workflows/tests.yml)
+
 Wallpaper Engine workshop wallpapers on **KDE Plasma 6 / Wayland**, with the
 quality-of-life pieces the bare renderer does not have: a graphical library and
 properties editor, per-monitor assignment, profiles, a slideshow, global
@@ -10,9 +12,10 @@ Built on [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine
 by Almamu, which does the actual rendering. This project only drives it.
 
 > **Status:** built for one machine (Nobara 44, Plasma 6.7 on Wayland, NVIDIA
-> RTX 4080, a 32:9 ultrawide). It works there and every feature below was
-> tested there. Expect rough edges elsewhere. UI strings and code comments are
-> in German.
+> RTX 4080, a 32:9 ultrawide plus a 4K second monitor). Every feature below
+> was tested there; `we-wallpaper doctor` tells you what your machine is
+> missing. The UI is English by default and German under a German locale.
+> Code comments are German.
 
 ## Why the pausing matters
 
@@ -28,28 +31,51 @@ The wallpaper is invisible while the screen is locked, while a game runs
 fullscreen, or while a maximized window covers every monitor. `we-wallpaper-watch`
 freezes the renderer in exactly those situations and thaws it afterwards.
 
-## The one hard limitation
+## Two backends — pick one
 
-On Plasma/Wayland the renderer draws into a layer-shell surface that always sits
-**above Plasma's desktop containment** — with every `--layer` setting. That means
-**desktop icons are hidden** while the wallpaper runs. This was tested three ways
-(renderer off → icons visible; `bottom` and `background` layers → icons hidden).
+| | own renderer (`linux-wallpaperengine`) | KDE plugin (`wallpaper-engine-kde-plugin`) |
+|---|---|---|
+| desktop icons | **hidden** (layer-shell surface sits above Plasma's desktop, on every `--layer`) | visible |
+| per-wallpaper properties, live preview, profiles, slideshow | yes | properties via the plugin's own dialog |
+| automatic pausing (fullscreen / lock / maximized) | yes, with ~19 W GPU saved | the plugin's own pause modes |
+| global shortcuts Meta+Shift+W/N/P | yes | — |
+| rendering | scene, video, web | depends on the plugin build |
 
-If you need desktop icons *and* an animated wallpaper, use
-[wallpaper-engine-kde-plugin](https://github.com/catsout/wallpaper-engine-kde-plugin)
-instead, which renders inside Plasma's own wallpaper layer. This project offers
-the next best thing: **Meta+Shift+W** toggles the wallpaper off and on instantly,
-so the icons are one keystroke away.
+Switch in the GUI (*Backend* box) or on the command line:
+
+```bash
+we-wallpaper backend            # show which one is active
+we-wallpaper backend kde-plugin # stop own renderer, activate the plugin with the assigned wallpaper
+we-wallpaper backend native     # back to the own renderer
+```
+
+Switching uses Plasma's scripting interface (`org.kde.PlasmaShell
+evaluateScript`) to set the wallpaper plugin of every desktop and write the
+plugin's configuration (`WallpaperWorkShopId`, `SteamLibraryPath`, `Fps`,
+`Volume`, `MuteAudio`, `MouseInput`). The plugin must be installed
+(Fedora/Nobara: COPR `kylegospo/wallpaper-engine-kde-plugin`; note that this
+package ships only the QML library — the Plasma package part is installed with
+`kpackagetool6 -t Plasma/Wallpaper -i plugin` from the upstream checkout).
+With the own renderer active, **Meta+Shift+W** still toggles the wallpaper off
+and on instantly, which frees the icons without switching backends.
+
+## Screenshot
+
+![we-wallpaper GUI](docs/images/gui-en.png)
+
+*Library with search filter, monitor list with the Backend box, properties editor for the selected wallpaper.*
 
 ## Components
 
 | file | role |
 |------|------|
-| `bin/we-wallpaper` | control script: start/stop/restart/status, profiles, slideshow, `toggle`, `next`, `thaw`, systemd install |
+| `bin/we-wallpaper` | control script: `doctor`, start/stop/restart/status, profiles, slideshow, `toggle`, `next`, `thaw`, `backend`, systemd install |
 | `bin/we-wallpaper-gui` | PySide6 application: library grid, filters, favourites, properties editor, live preview, profiles, tray icon |
 | `bin/we-wallpaper-watch` | pause daemon: freezes the renderer on fullscreen / lock / maximized / manual; owns the KWin script and the global shortcuts |
 | `share/fullscreen-watch.js` | KWin script: detects fullscreen and maximized windows, registers the shortcuts, reports over D-Bus |
 | `systemd/*.service` | user units (auto-restart on crash, bound to the Plasma session) |
+| `packaging/` | RPM spec and `build-rpm.sh` (builds locally with `rpmbuild`) |
+| `tests/` | unit tests (`tests/run.sh`), run by CI on every push |
 | `contrib/we-ambient-guard` | unrelated to wallpapers: works around an OpenRGB Effects-plugin deadlock and duplicate OpenRGB starts; see below |
 
 ## Requirements
@@ -70,8 +96,15 @@ so the icons are one keystroke away.
 git clone https://github.com/pbaetz99/we-wallpaper.git
 cd we-wallpaper
 ./install.sh            # copies to ~/.local/bin, ~/.local/share, adds the menu entry
+we-wallpaper doctor     # checks every prerequisite and says what is missing
 we-wallpaper list       # shows your subscribed wallpapers
-we-wallpaper-gui        # assign wallpapers, click "Anwenden"
+we-wallpaper-gui        # assign wallpapers, click "Apply"
+```
+
+Or build an RPM (`rpm-build`, `rpmdevtools`, `systemd-rpm-macros`):
+
+```bash
+packaging/build-rpm.sh  # writes ~/rpmbuild/RPMS/noarch/we-wallpaper-*.rpm
 ```
 
 To run as systemd user services (recommended — auto-restart, session-bound):
@@ -86,7 +119,9 @@ twice. `we-wallpaper uninstall-service` reverts it.
 ## Usage
 
 ```
+we-wallpaper doctor            # prerequisites check with hints
 we-wallpaper start|stop|restart|status|list
+we-wallpaper backend [native|kde-plugin]
 we-wallpaper toggle            # renderer off/on, keeps the watcher alive
 we-wallpaper next              # advance the slideshow now
 we-wallpaper thaw              # emergency: wake a frozen renderer
@@ -115,6 +150,9 @@ System Settings → Shortcuts → KWin):
   },
   "spans": [],                 // [{outputs:[...], id, scaling, clamp, properties}]
   "layer": "bottom",           // background|bottom|top|overlay
+  "renderer": "",              // path to linux-wallpaperengine; empty = default, WE_RENDERER wins
+  "backend": "native",         // native | kde-plugin
+  "per_output": false,         // one renderer process per monitor -> pausing per monitor
   "fps": 30, "volume": 15, "silent": false, "noautomute": true,
   "disable_particles": false, "disable_mouse": false, "disable_parallax": false,
   "pause_on_fullscreen": true, "pause_on_lock": true, "pause_on_maximized": true,
@@ -135,6 +173,12 @@ renderer cannot detect fullscreen windows by itself. `fullscreen-watch.js` runs
 inside KWin, watches window state, and calls `we-wallpaper-watch` over D-Bus
 (`org.wewallpaper.Watch`). The daemon freezes the renderer with `SIGSTOP` and
 resumes it with `SIGCONT`.
+
+With `"per_output": true` there is one renderer process per monitor (spans stay
+one process) and a supervisor inside the systemd unit restarts a crashed one.
+The daemon then freezes only the process whose monitor is covered — a
+fullscreen game on one screen no longer stops the wallpaper on the other. In
+the default single-process mode the rule is "every monitor covered".
 
 A frozen process depends on somebody waking it up, so there are several safety
 nets: the daemon wakes the renderer on start and on exit, a watchdog checks
@@ -174,24 +218,16 @@ effect back if an effect profile with *AutoStart* is saved in the plugin.
 
 ## Roadmap / known gaps
 
-Ordered by how much they would matter day to day.
-
-1. **Desktop icons.** The layer-shell approach cannot show them; the real fix is
-   to render inside Plasma's wallpaper layer, i.e. become (or build on) a KDE
-   wallpaper plugin. Everything above the renderer — GUI, profiles, pausing —
-   would carry over.
-2. **Per-output pausing.** There is one renderer process for all monitors, so
-   "maximized window on every monitor" is the only safe rule. One process per
-   output would allow pausing a single screen.
-3. **`--screen-span` is untested at runtime.** The argument building is covered
-   by tests; the second monitor of the reference machine was off. Needs a real
-   dual-monitor check.
-4. **Renderer path in the config** instead of only `WE_RENDERER`.
-5. **English UI** (strings are German) and a proper translation setup.
-6. **Packaging** — RPM/COPR spec, so `install.sh` becomes optional.
-7. **Tests as a suite.** The checks that exist (config round-trips, condition
-   evaluation, argument building, pause state machine) live in the development
-   history, not in `tests/`.
+- **COPR / distribution packages.** The spec builds locally; publishing to a
+  COPR is the next step.
+- **KDE-plugin rendering** on this machine still showed a black wallpaper with
+  the COPR library (`git.638`) and the upstream QML package, tried both at HEAD
+  and at upstream commit #638 — a mismatch between the two halves. The switch
+  itself works (icons visible, plugin active, config written); rendering needs
+  a plugin built from one consistent source tree.
+- **Per-output span pausing.** A span is one process; a fullscreen window on one
+  of its monitors pauses the whole span.
+- More translations than German/English.
 
 ## License
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Wallpaper Engine Renderer (linux-wallpaperengine)
+Documentation=https://github.com/Almamu/linux-wallpaperengine
+PartOf=plasma-workspace.target
+# After=plasma-core.target, NICHT plasma-workspace.target: zusammen mit
+# WantedBy=plasma-workspace.target ergaebe das einen Ordering-Zyklus, und
+# systemd loescht dann den Start-Job ("Job ... deleted to break ordering cycle").
+# plasma-core.target garantiert, dass KWin fuer Layer-Shell und Skripte steht.
+After=plasma-core.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/we-wallpaper run-renderer
+Restart=on-failure
+RestartSec=5
+# Beim Stoppen zuverlaessig auch eingefrorene Prozesse einsammeln
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=plasma-workspace.target
