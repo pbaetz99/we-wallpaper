@@ -126,10 +126,28 @@ if __name__ == "__main__":
 
 
 class BackendTests(unittest.TestCase):
+    """Diese Tests duerfen NIE die echte Plasma-Sitzung anfassen: Plugin-Suchorte
+    zeigen auf ein Temp-Verzeichnis, und alles, was das System veraendert
+    (Plasma-Skript, systemctl, Renderer stoppen/starten), ist ersetzt."""
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.m = load("we-wallpaper", HOME=self.tmp, WORKSHOP=self.tmp / "ws",
                       CONF=self.tmp / "c.json", STATE=self.tmp / "state")
+        self.m.KDE_PLUGIN_ROOTS = [self.tmp / ".local/share/plasma/wallpapers"]
+        self.scripts = []
+        self.m.plasma_script = lambda js: (self.scripts.append(js) or "ok:stub")
+        self.m.systemctl = lambda *a, **k: None
+        self.m.service_enabled = lambda: False
+        self.m.service_installed = lambda: False
+        self.m.do_stop = lambda quiet=False: True
+        self.m.spawn = lambda cfg: True
+        self.m.do_status = lambda: 0
+        self.m.time.sleep = lambda s: None
+
+    def wallpaper(self, wid, wtype="video", wfile="movie.mp4"):
+        d = self.m.WORKSHOP / wid; d.mkdir(parents=True, exist_ok=True)
+        (d / "project.json").write_text(json.dumps({"file": wfile, "type": wtype, "title": "T" + wid}))
+        return d
 
     def fake_plugin(self, plugin_id="com.github.catsout.wallpaperEngineKde"):
         d = self.tmp / ".local/share/plasma/wallpapers" / plugin_id
@@ -145,14 +163,23 @@ class BackendTests(unittest.TestCase):
 
     def test_plugin_script_contents(self):
         self.fake_plugin()
+        wp = self.m.WORKSHOP / "123"; wp.mkdir(parents=True)
+        (wp / "project.json").write_text(json.dumps({"file": "movie.mp4", "type": "Video"}))
         cfg = {"screens": {"DP-1": {"id": "123"}}, "fps": 24, "volume": 40, "silent": True, "disable_mouse": True}
         js = self.m.build_kde_plugin_script(cfg, "123")
+        # gepacktes Format des Plugins: <Ordner>/<Datei>+<typ> (Typ kleingeschrieben)
+        self.assertIn(f'writeConfig("WallpaperSource", "{wp}/movie.mp4+video")', js)
         for needle in ('d.wallpaperPlugin = "com.github.catsout.wallpaperEngineKde"',
                        'writeConfig("WallpaperWorkShopId", "123")', 'writeConfig("Fps", 24)',
                        'writeConfig("Volume", 40)', 'writeConfig("MuteAudio", true)',
                        'writeConfig("MouseInput", false)', 'writeConfig("SteamLibraryPath", "file://'):
             self.assertIn(needle, js)
         self.assertIn(str(self.m.WORKSHOP / "123"), js)
+
+    def test_plugin_script_defaults_to_scene(self):
+        self.fake_plugin()
+        js = self.m.build_kde_plugin_script({"screens": {}, "fps": 30}, "999")   # kein project.json
+        self.assertIn('/999/scene.json+scene"', js)
 
     def test_restore_script_targets_only_plugin(self):
         self.fake_plugin()
@@ -161,6 +188,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn('"org.kde.image"', js)
 
     def test_backend_refuses_without_plugin(self):
+        self.wallpaper("123")
         self.m.save_conf({"screens": {"DP-1": {"id": "123"}}})
         import io, contextlib
         err = io.StringIO()
@@ -169,6 +197,29 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("nicht installiert", err.getvalue())
         self.assertEqual(self.m.load_conf().get("backend", "native"), "native")
+
+    def test_backend_switch_video_and_back(self):
+        self.fake_plugin(); self.wallpaper("123", "video")
+        self.m.save_conf({"screens": {"DP-1": {"id": "123"}}})
+        self.assertEqual(self.m.do_backend("kde-plugin"), 0)
+        self.assertEqual(self.m.load_conf()["backend"], "kde-plugin")
+        self.assertIn('WallpaperSource", "', self.scripts[-1]); self.assertIn("movie.mp4+video", self.scripts[-1])
+        self.assertEqual(self.m.do_backend("native"), 0)
+        self.assertEqual(self.m.load_conf()["backend"], "native")
+        self.assertIn('"org.kde.image"', self.scripts[-1])
+
+    def test_backend_refuses_scene_unless_forced(self):
+        import io, contextlib
+        self.fake_plugin(); self.wallpaper("777", "scene", "scene.json")
+        self.m.save_conf({"screens": {"DP-1": {"id": "777"}}})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.m.do_backend("kde-plugin"), 3)
+        self.assertIn("scene", err.getvalue()); self.assertEqual(self.scripts, [])
+        self.assertEqual(self.m.do_backend("kde-plugin", force=True), 0)
+        self.assertIn("scene.json+scene", self.scripts[-1])
+        self.m.save_conf({"screens": {"DP-1": {"id": "777"}}, "kde_plugin_allow_scene": True})
+        self.assertEqual(self.m.do_backend("kde-plugin"), 0)
 
 
 class PerOutputTests(unittest.TestCase):

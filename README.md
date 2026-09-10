@@ -39,7 +39,7 @@ freezes the renderer in exactly those situations and thaws it afterwards.
 | per-wallpaper properties, live preview, profiles, slideshow | yes | properties via the plugin's own dialog |
 | automatic pausing (fullscreen / lock / maximized) | yes, with ~19 W GPU saved | the plugin's own pause modes |
 | global shortcuts Meta+Shift+W/N/P | yes | — |
-| rendering | scene, video, web | depends on the plugin build |
+| rendering | scene, video, web | **video and web** (verified here); scene wallpapers crashed plasmashell with the plugin's scene backend, so the switch refuses them unless forced |
 
 Switch in the GUI (*Backend* box) or on the command line:
 
@@ -51,13 +51,22 @@ we-wallpaper backend native     # back to the own renderer
 
 Switching uses Plasma's scripting interface (`org.kde.PlasmaShell
 evaluateScript`) to set the wallpaper plugin of every desktop and write the
-plugin's configuration (`WallpaperWorkShopId`, `SteamLibraryPath`, `Fps`,
-`Volume`, `MuteAudio`, `MouseInput`). The plugin must be installed
-(Fedora/Nobara: COPR `kylegospo/wallpaper-engine-kde-plugin`; note that this
-package ships only the QML library — the Plasma package part is installed with
-`kpackagetool6 -t Plasma/Wallpaper -i plugin` from the upstream checkout).
-With the own renderer active, **Meta+Shift+W** still toggles the wallpaper off
-and on instantly, which frees the icons without switching backends.
+plugin's configuration (`WallpaperSource` in the plugin's packed
+`<folder>/<file>+<type>` form, `WallpaperWorkShopId`, `SteamLibraryPath`,
+`Fps`, `Volume`, `MuteAudio`, `MouseInput`).
+
+**Installing the plugin:** build it from one source tree with
+`packaging/build-kde-plugin.sh` (clones with submodules, builds, prints the
+`sudo cmake --install` step). Do not mix the COPR package with an upstream QML
+package — the COPR RPM ships only the QML library, and a QML package from a
+different commit renders black.
+
+**Scene wallpapers:** with the plugin's scene backend, a scene wallpaper made
+plasmashell abort on the reference machine (missing render targets in that
+scene). `we-wallpaper backend kde-plugin` therefore refuses scene wallpapers;
+`--force` or `"kde_plugin_allow_scene": true` overrides that at your own risk.
+Use the own renderer for scenes — with **Meta+Shift+W** the icons are one
+keystroke away.
 
 ## Screenshot
 
@@ -74,7 +83,7 @@ and on instantly, which frees the icons without switching backends.
 | `bin/we-wallpaper-watch` | pause daemon: freezes the renderer on fullscreen / lock / maximized / manual; owns the KWin script and the global shortcuts |
 | `share/fullscreen-watch.js` | KWin script: detects fullscreen and maximized windows, registers the shortcuts, reports over D-Bus |
 | `systemd/*.service` | user units (auto-restart on crash, bound to the Plasma session) |
-| `packaging/` | RPM spec and `build-rpm.sh` (builds locally with `rpmbuild`) |
+| `packaging/` | RPM spec, `build-rpm.sh`, and `build-kde-plugin.sh` (builds the KDE plugin from one source tree) |
 | `tests/` | unit tests (`tests/run.sh`), run by CI on every push |
 | `contrib/we-ambient-guard` | unrelated to wallpapers: works around an OpenRGB Effects-plugin deadlock and duplicate OpenRGB starts; see below |
 
@@ -220,11 +229,11 @@ effect back if an effect profile with *AutoStart* is saved in the plugin.
 
 - **COPR / distribution packages.** The spec builds locally; publishing to a
   COPR is the next step.
-- **KDE-plugin rendering** on this machine still showed a black wallpaper with
-  the COPR library (`git.638`) and the upstream QML package, tried both at HEAD
-  and at upstream commit #638 — a mismatch between the two halves. The switch
-  itself works (icons visible, plugin active, config written); rendering needs
-  a plugin built from one consistent source tree.
+- **Scene wallpapers with desktop icons.** The KDE plugin's scene backend is
+  not stable for every scene; the own renderer handles scenes but hides the
+  icons. Both facts come from the compositor: Plasma's desktop window is
+  composited opaque, so nothing below it can show through — a wallpaper has
+  to be drawn *inside* Plasma's wallpaper layer to sit under the icons.
 - **Per-output span pausing.** A span is one process; a fullscreen window on one
   of its monitors pauses the whole span.
 - More translations than German/English.

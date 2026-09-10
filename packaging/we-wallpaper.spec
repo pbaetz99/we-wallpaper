@@ -1,5 +1,5 @@
 Name:           we-wallpaper
-Version:        0.2.0
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        Wallpaper Engine workshop wallpapers on KDE Plasma 6 / Wayland
 License:        MIT
@@ -56,6 +56,8 @@ QT_QPA_PLATFORM=offscreen WE_LANG=de python3 -m unittest discover -s tests -p 't
 %{_datadir}/applications/we-wallpaper-gui.desktop
 
 %changelog
+* Thu Sep 10 2026 pbaetz99 - 0.2.1-1
+- KDE plugin: packed WallpaperSource, build helper, scene guard
 * Thu Sep 10 2026 pbaetz99 - 0.2.0-1
 - English UI, doctor command, renderer config key, test suite, docs, KDE-plugin backend switch
 * Thu Sep 10 2026 pbaetz99 - 0.1.0-1

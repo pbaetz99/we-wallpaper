@@ -55,7 +55,16 @@ that restarts a crashed child after 3 s and forwards `SIGTERM`.
 then runs a Plasma script over `org.kde.PlasmaShell.evaluateScript` that sets
 `wallpaperPlugin` of every desktop to the plugin id read from its
 `metadata.json` and writes its config group. `backend native` restores
-`org.kde.image` and re-enables the units. The plugin is detected under
+`org.kde.image` and re-enables the units. `WallpaperSource` must be the
+plugin's packed form `<folder>/<file>+<type>`; the type selects the plugin's
+backend (Mpv, QtWebView, Scene). Scene wallpapers are refused without
+`--force` after a plasmashell crash with the scene backend.
+
+**Why can't the own renderer sit under the icons?** Even with `--layer
+background` and KWin's stacking order confirming the renderer below
+plasmashell's desktop window, and a transparent wallpaper plugin loaded, the
+desktop stayed black: KWin composites plasmashell's desktop window opaque, so
+nothing beneath it is visible. The plugin is detected under
 `~/.local/share/plasma/wallpapers` and `/usr/share/plasma/wallpapers`.
 
 ## Pause daemon — `bin/we-wallpaper-watch`

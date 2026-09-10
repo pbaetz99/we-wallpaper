@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] – 2026-09-10
+
+### Fixed
+- `backend kde-plugin` writes `WallpaperSource` in the plugin's packed
+  `<folder>/<file>+<type>` form. With a bare path the plugin had no backend
+  ("Source is empty") and the desktop stayed black.
+
+### Added
+- `packaging/build-kde-plugin.sh`: builds wallpaper-engine-kde-plugin from one
+  source tree (library and Plasma package), which is what makes it render.
+- Scene guard: the switch refuses scene wallpapers because the plugin's scene
+  backend crashed plasmashell here; `--force` or `kde_plugin_allow_scene`.
+- Verified on the reference machine: a video wallpaper through the plugin
+  **with desktop icons visible**.
+
+### Changed
+- Backend tests no longer touch the running session: plugin search roots and
+  every system call are replaced in the test.
+
 ## [0.2.0] – 2026-09-10
 
 ### Added

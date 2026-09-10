@@ -135,6 +135,7 @@ STRINGS = {
         "wallpaper-engine-kde-plugin is not installed.\n\nFedora/Nobara:\n  sudo dnf copr enable kylegospo/wallpaper-engine-kde-plugin\n  sudo dnf install wallpaper-engine-kde-plugin\n\nOther distributions: see the project page.",
     "Projektseite öffnen": "Open project page",
     "Backend gewechselt": "Backend switched",
+    "Wechsel abgelehnt": "Switch refused",
     "Schemafarbe": "Scheme colour", "Hintergrundfarbe": "Background colour", "Farbe": "Colour", "Deckkraft": "Opacity",
     "Geschwindigkeit": "Speed", "Groesse": "Size", "Ausrichtung": "Alignment", "Bild": "Image", "Text": "Text", "Lautstaerke": "Volume",
 }
@@ -1501,7 +1502,9 @@ class Window(QMainWindow):
         try:
             r = subprocess.run([str(CTL), "backend", target], timeout=120,
                                capture_output=True, text=True)
-            if r.returncode != 0:
+            if r.returncode == 3:
+                QMessageBox.warning(self, _("Wechsel abgelehnt"), (r.stderr or r.stdout).strip()[:800])
+            elif r.returncode != 0:
                 QMessageBox.critical(self, _("Fehler"), (r.stderr or r.stdout).strip()[:600])
         except Exception as e:
             QMessageBox.critical(self, _("Fehler"), str(e))

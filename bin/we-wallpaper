@@ -480,6 +480,14 @@ def do_run_renderer():
 # setzen kann. Der eigene Renderer wird dabei gestoppt.
 KDE_PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"
 KDE_PLUGIN_URL = "https://github.com/catsout/wallpaper-engine-kde-plugin"
+# Suchorte fuer das Plugin; Tests setzen die Liste auf ein Temp-Verzeichnis
+KDE_PLUGIN_ROOTS = [HOME / ".local/share/plasma/wallpapers",
+                    Path("/usr/share/plasma/wallpapers"),
+                    Path("/usr/local/share/plasma/wallpapers")]
+# Typen, die das Plugin hier zuverlaessig rendert. Ein Scene-Wallpaper hat mit dem
+# Scene-Backend des Plugins plasmashell mit SIGABRT abgeschossen (fehlende
+# Render-Targets/Assets) - deshalb nur mit --force.
+KDE_PLUGIN_SAFE_TYPES = {"video", "web"}
 STEAM_LIB = HOME / ".local/share/Steam"
 
 
@@ -487,9 +495,7 @@ def kde_plugin_dir():
     """Verzeichnis des installierten Plugins - gesucht unter allen Orten, an
     denen Plasma Wallpaper-Plugins laedt (Distributionspakete legen es nach
     /usr/share/plasma/wallpapers, manuelle Installationen nach ~/.local/share)."""
-    roots = [HOME / ".local/share/plasma/wallpapers", Path("/usr/share/plasma/wallpapers"),
-             Path("/usr/local/share/plasma/wallpapers")]
-    for root in roots:
+    for root in KDE_PLUGIN_ROOTS:
         if not root.is_dir():
             continue
         for d in sorted(root.iterdir()):
@@ -547,6 +553,17 @@ def build_kde_plugin_script(cfg, wallpaper_id):
     """Plasma-Skript, das das KDE-Plugin aktiviert und konfiguriert."""
     pid = kde_plugin_id()
     ws = str(WORKSHOP / wallpaper_id)
+    # Das Plugin erwartet in WallpaperSource "<Ordner>/<Datei>+<Typ>" (siehe
+    # Common.packWallpaperSource) und waehlt nach dem Typ sein Backend
+    # (scene / video / web). Eine nackte URL ergibt "Source is empty".
+    try:
+        pj = json.loads((WORKSHOP / wallpaper_id / "project.json").read_text(
+            encoding="utf-8", errors="replace"))
+    except Exception:
+        pj = {}
+    wfile = pj.get("file") or "scene.json"
+    wtype = (pj.get("type") or "scene").lower()
+    packed = f"{ws}/{wfile}+{wtype}"
     return (
         'var ds = desktops();'
         'for (var i = 0; i < ds.length; i++) {'
@@ -555,7 +572,7 @@ def build_kde_plugin_script(cfg, wallpaper_id):
         f'  d.currentConfigGroup = ["Wallpaper", {_js_str(pid)}, "General"];'
         f'  d.writeConfig("SteamLibraryPath", {_js_str("file://" + str(STEAM_LIB))});'
         f'  d.writeConfig("WallpaperWorkShopId", {_js_str(wallpaper_id)});'
-        f'  d.writeConfig("WallpaperSource", {_js_str("file://" + ws)});'
+        f'  d.writeConfig("WallpaperSource", {_js_str(packed)});'
         f'  d.writeConfig("Fps", {int(cfg.get("fps", 30))});'
         f'  d.writeConfig("Volume", {int(cfg.get("volume", 15))});'
         f'  d.writeConfig("MuteAudio", {"true" if cfg.get("silent") else "false"});'
@@ -574,7 +591,15 @@ def build_native_restore_script():
         'print("restored:" + n);')
 
 
-def do_backend(target=None):
+def wallpaper_type(wid):
+    try:
+        return (json.loads((WORKSHOP / str(wid) / "project.json").read_text(
+            encoding="utf-8", errors="replace")).get("type") or "scene").lower()
+    except Exception:
+        return "scene"
+
+
+def do_backend(target=None, force=False):
     cfg = load_conf()
     if target is None:
         cur = cfg.get("backend") or "native"
@@ -599,6 +624,15 @@ def do_backend(target=None):
         if not wid.isdigit():
             print("kein Wallpaper zugewiesen - erst in der GUI zuweisen", file=sys.stderr)
             return 1
+        wtype = wallpaper_type(wid)
+        if wtype not in KDE_PLUGIN_SAFE_TYPES and not force and not cfg.get("kde_plugin_allow_scene"):
+            print(f"Wallpaper {wid} ({title_of(wid)}) ist vom Typ '{wtype}'. Das Scene-Backend des\n"
+                  "KDE-Plugins hat auf dieser Maschine plasmashell zum Absturz gebracht; das Plugin\n"
+                  "rendert hier zuverlaessig nur video und web.\n"
+                  "  Trotzdem versuchen: we-wallpaper backend kde-plugin --force\n"
+                  "  Dauerhaft erlauben:  \"kde_plugin_allow_scene\": true in der Config",
+                  file=sys.stderr)
+            return 3
         do_stop(quiet=True)
         if service_enabled():
             systemctl("disable", "--now", UNIT_RENDER, UNIT_WATCH)
@@ -1011,8 +1045,8 @@ def do_doctor():
         "In der GUI ein Wallpaper einem Monitor zuweisen und 'Anwenden'.")
     add(service_enabled(), "als systemd-Dienst eingerichtet (empfohlen)",
         "we-wallpaper install-service")
-    add(kde_plugin_installed(), "wallpaper-engine-kde-plugin (optional, fuer Desktop-Icons)",
-        f"Optionales Backend; behaelt Desktop-Icons. {KDE_PLUGIN_URL}")
+    add(kde_plugin_installed(), "wallpaper-engine-kde-plugin (optional, fuer Desktop-Icons; video/web)",
+        f"Optionales Backend; behaelt Desktop-Icons. packaging/build-kde-plugin.sh oder {KDE_PLUGIN_URL}")
 
     bad = 0
     for ok, text, hint in checks:
@@ -1031,7 +1065,8 @@ def main():
     if action == "doctor":
         return do_doctor()
     if action == "backend":
-        return do_backend(sys.argv[2] if len(sys.argv) > 2 else None)
+        return do_backend(sys.argv[2] if len(sys.argv) > 2 else None,
+                          force="--force" in sys.argv[3:])
     if action == "start":
         return do_start()
     if action == "restart":
