@@ -107,7 +107,7 @@ def renderer_map():
     return out
 
 
-def decide(mapping, global_reasons, per_output_reasons):
+def decide(mapping, global_reasons, per_output_reasons, span_any=False):
     """Reine Entscheidungsfunktion: welche PIDs sollen eingefroren sein?
 
     mapping: {pid: [Monitore]}; global_reasons: Liste von Gruenden, die fuer
@@ -115,6 +115,11 @@ def decide(mapping, global_reasons, per_output_reasons):
     eingefroren, wenn ein globaler Grund vorliegt oder JEDER seiner Monitore
     einen eigenen Grund hat ("*" = alle Monitore -> alle bekannten muessen
     betroffen sein).
+
+    span_any: Prozesse, die mehrere benannte Monitore rendern (Spans), frieren
+    schon ein, wenn EINER ihrer Monitore einen Grund hat. Ein Span ist eine
+    Flaeche - die sichtbare Haelfte steht dann mit; dafuer spart es GPU.
+    Standard ist "alle" (die sichtbare Haelfte laeuft weiter).
     """
     result = {}
     known = [m for m in per_output_reasons.keys()]
@@ -123,8 +128,10 @@ def decide(mapping, global_reasons, per_output_reasons):
             result[pid] = global_reasons[0]
             continue
         targets = known if outs == ["*"] else outs
-        if targets and all(per_output_reasons.get(o) for o in targets):
-            result[pid] = per_output_reasons[targets[0]][0]
+        is_span = outs != ["*"] and len(outs) > 1
+        hit = [o for o in targets if per_output_reasons.get(o)]
+        if targets and ((span_any and is_span and hit) or len(hit) == len(targets)):
+            result[pid] = per_output_reasons[hit[0]][0]
         else:
             result[pid] = None
     return result
@@ -236,7 +243,7 @@ class Watch(QObject):
     def pause_reason(self):
         """Grund fuer den ersten Renderer (fuer Log/Status) oder None."""
         glob, per = self.reasons()
-        d = decide(renderer_map(), glob, per)
+        d = decide(renderer_map(), glob, per, span_any=conf_flag("span_pause_any", False))
         return next((r for r in d.values() if r), None)
 
     def apply(self):
@@ -246,7 +253,7 @@ class Watch(QObject):
             self.frozen_pid = None
             return
         glob, per = self.reasons()
-        wanted = decide(mapping, glob, per)
+        wanted = decide(mapping, glob, per, span_any=conf_flag("span_pause_any", False))
         any_frozen = None
         for pid, reason in wanted.items():
             state = proc_state(pid)
@@ -349,7 +356,7 @@ class Watch(QObject):
             self.frozen_pid = None
             return
         glob, per = self.reasons()
-        wanted = decide(renderer_map(), glob, per)
+        wanted = decide(renderer_map(), glob, per, span_any=conf_flag("span_pause_any", False))
         for p, reason in wanted.items():
             st = proc_state(p)
             if reason is None and st == "T":

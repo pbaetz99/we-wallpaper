@@ -88,6 +88,9 @@ STRINGS = {
     "keine Partikel": "no particles", "Partikeleffekte abschalten (spart GPU)": "Disable particle effects (saves GPU)",
     "keine Maus": "no mouse", "Mausinteraktion des Wallpapers abschalten": "Disable the wallpaper's mouse interaction",
     "kein Parallax": "no parallax", "Parallax-Effekt abschalten": "Disable the parallax effect",
+    "Span: ein Monitor reicht": "Span: any monitor",
+    "Ein Wallpaper, das ueber mehrere Monitore gespannt ist, pausiert schon,\nwenn EINER davon verdeckt ist. Sonst erst, wenn alle verdeckt sind\n(die sichtbare Haelfte laeuft dann weiter, kostet aber GPU).":
+        "A wallpaper spanning several monitors pauses as soon as ONE of them\nis covered. Otherwise only when all are covered (the visible half keeps\nrunning, at the cost of GPU).",
     "Sperre-Pause": "Pause on lock",
     "Renderer einfrieren, solange der Bildschirm gesperrt ist.\nSpart ~19 W GPU, waehrend niemand hinsieht.": "Freeze the renderer while the screen is locked.\nSaves ~19 W of GPU while nobody is looking.",
     "Maximiert-Pause": "Pause on maximized",
@@ -458,6 +461,7 @@ DEFAULT_CONF = {
     "no_audio_processing": False, "disable_particles": False, "disable_mouse": False,
     "disable_parallax": False, "no_fullscreen_pause": False,
     "pause_on_fullscreen": True, "pause_on_lock": True, "pause_on_maximized": True,
+    "span_pause_any": False,
     "rotation": {"enabled": False, "minutes": 30, "pool": [], "order": "random"},
     "profiles": {}, "spans": [], "favorites": [], "hidden": [], "backend": "native",
 }
@@ -1025,6 +1029,10 @@ class Window(QMainWindow):
              "Renderer einfrieren, wenn auf jedem Monitor mit Wallpaper ein\n"
              "maximiertes oder Vollbild-Fenster liegt - das Wallpaper ist dann\n"
              "ohnehin unsichtbar."),
+            ("span_pause_any", "Span: ein Monitor reicht",
+             "Ein Wallpaper, das ueber mehrere Monitore gespannt ist, pausiert schon,\n"
+             "wenn EINER davon verdeckt ist. Sonst erst, wenn alle verdeckt sind\n"
+             "(die sichtbare Haelfte laeuft dann weiter, kostet aber GPU)."),
             ("pause_on_fullscreen", "Vollbild-Pause",
              "Renderer einfrieren, solange ein Fenster im Vollbild laeuft.\n"
              "Eigene Erkennung per KWin-Skript, da KWin das dafuer noetige\n"

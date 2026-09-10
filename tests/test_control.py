@@ -282,3 +282,17 @@ class DecideTests(unittest.TestCase):
 
     def test_no_outputs_known(self):
         self.assertEqual(self.w.decide({7: ["*"]}, [], {}), {7: None})
+
+    def test_span_default_needs_all_outputs(self):
+        per = {"DP-1": ["Vollbild"], "HDMI-A-1": []}
+        self.assertEqual(self.w.decide({9: ["DP-1", "HDMI-A-1"]}, [], per), {9: None})
+        per["HDMI-A-1"] = ["Fenster maximiert"]
+        self.assertEqual(self.w.decide({9: ["DP-1", "HDMI-A-1"]}, [], per), {9: "Vollbild"})
+
+    def test_span_any_mode(self):
+        per = {"DP-1": ["Vollbild"], "HDMI-A-1": []}
+        self.assertEqual(self.w.decide({9: ["DP-1", "HDMI-A-1"]}, [], per, span_any=True), {9: "Vollbild"})
+        # Einzelmonitor-Prozesse sind keine Spans: der Modus aendert nichts an ihnen
+        self.assertEqual(self.w.decide({1: ["DP-1"], 2: ["HDMI-A-1"]}, [], per, span_any=True), {1: "Vollbild", 2: None})
+        # und "*" (ein Prozess fuer alles) bleibt bei "alle Monitore"
+        self.assertEqual(self.w.decide({7: ["*"]}, [], per, span_any=True), {7: None})

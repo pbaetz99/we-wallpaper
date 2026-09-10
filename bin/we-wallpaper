@@ -53,6 +53,7 @@ DEFAULTS = {
     "renderer": "",         # Pfad zum linux-wallpaperengine-Binary; leer = Standard
     "backend": "native",    # native = linux-wallpaperengine | kde-plugin = wallpaper-engine-kde-plugin
     "per_output": False,    # ein Renderer-Prozess je Monitor -> Pausieren pro Monitor moeglich
+    "span_pause_any": False, # Span schon pausieren, wenn EIN Monitor verdeckt ist (statt alle)
     "layer": "background",  # wlr-layer-shell-Ebene: background|bottom|top|overlay
                             # 'bottom' verdeckt auf Plasma die Desktop-Icons
     "spans": [],           # [{outputs:[...], id, scaling, clamp, properties}]

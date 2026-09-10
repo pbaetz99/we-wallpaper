@@ -169,6 +169,7 @@ System Settings → Shortcuts → KWin):
   "renderer": "",              // path to linux-wallpaperengine; empty = default, WE_RENDERER wins
   "backend": "native",         // native | kde-plugin
   "per_output": false,         // one renderer process per monitor -> pausing per monitor
+  "span_pause_any": false,     // a span pauses when ONE of its monitors is covered (default: all)
   "fps": 30, "volume": 15, "silent": false, "noautomute": true,
   "disable_particles": false, "disable_mouse": false, "disable_parallax": false,
   "pause_on_fullscreen": true, "pause_on_lock": true, "pause_on_maximized": true,
@@ -194,7 +195,10 @@ With `"per_output": true` there is one renderer process per monitor (spans stay
 one process) and a supervisor inside the systemd unit restarts a crashed one.
 The daemon then freezes only the process whose monitor is covered — a
 fullscreen game on one screen no longer stops the wallpaper on the other. In
-the default single-process mode the rule is "every monitor covered".
+the default single-process mode the rule is "every monitor covered". A span is
+one surface and cannot be paused by halves; `"span_pause_any": true` pauses it
+as soon as one of its monitors is covered (saves GPU), the default waits for
+all of them (the visible half keeps moving).
 
 A frozen process depends on somebody waking it up, so there are several safety
 nets: the daemon wakes the renderer on start and on exit, a watchdog checks
@@ -241,8 +245,6 @@ effect back if an effect profile with *AutoStart* is saved in the plugin.
   icons. Both facts come from the compositor: Plasma's desktop window is
   composited opaque, so nothing below it can show through — a wallpaper has
   to be drawn *inside* Plasma's wallpaper layer to sit under the icons.
-- **Per-output span pausing.** A span is one process; a fullscreen window on one
-  of its monitors pauses the whole span.
 - More translations than German/English.
 
 ## License

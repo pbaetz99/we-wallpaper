@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] – 2026-09-11
+
+### Added
+- `span_pause_any`: a wallpaper spanning several monitors pauses as soon as
+  one of them is covered by a fullscreen or maximized window; the default keeps
+  waiting for all of them. Checkbox in the GUI, covered by `DecideTests`.
+
 ## [0.2.2] – 2026-09-10
 
 ### Added
