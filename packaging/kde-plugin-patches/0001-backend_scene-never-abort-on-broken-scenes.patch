@@ -1,5 +1,5 @@
 diff --git a/src/SceneWallpaper.cpp b/src/SceneWallpaper.cpp
-index e5bfbec..1dc10be 100644
+index e5bfbec..eb5b9a9 100644
 --- a/src/SceneWallpaper.cpp
 +++ b/src/SceneWallpaper.cpp
 @@ -1,3 +1,4 @@
@@ -16,9 +16,9 @@ index e5bfbec..1dc10be 100644
 -            if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
 -            m_render->compileRenderGraph(*m_scene, *m_rg);
 -            m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
-+            // we-wallpaper: der Render-Graph entsteht auf dem Render-Thread; eine
-+            // Ausnahme hier (z.B. std::out_of_range bei unbekannten Render-Targets)
-+            // wuerde plasmashell beenden. Stattdessen die Szene verwerfen.
++            // Render-graph construction runs on the render thread. An exception
++            // here (e.g. std::out_of_range for an unknown render target) would
++            // terminate the host process; drop the scene instead.
 +            try {
 +                m_rg = sceneToRenderGraph(*m_scene);
 +
@@ -42,8 +42,8 @@ index e5bfbec..1dc10be 100644
              return;
          }
 -        scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager);
-+        // we-wallpaper: ein defektes Szenenpaket darf nie plasmashell beenden -
-+        // jede Ausnahme des Parsers wird zu "keine Szene" mit Fehlermeldung.
++        // A broken scene package must never terminate the host process:
++        // any parser exception becomes "no scene" plus an error message.
 +        try {
 +            scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager);
 +        } catch (const std::exception& e) {
@@ -57,16 +57,16 @@ index e5bfbec..1dc10be 100644
      }
  
 diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
-index 487c9f9..8d89f85 100644
+index 487c9f9..d1780f9 100644
 --- a/src/WPSceneParser.cpp
 +++ b/src/WPSceneParser.cpp
 @@ -338,6 +338,11 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                  svData.renderTargets.push_back({ i, name });
              } else if (pScene->renderTargets.count(name) == 0) {
                  LOG_ERROR("%s not found in render targes", name.c_str());
-+                // we-wallpaper: unbekanntes Render-Target nicht im Material lassen -
-+                // ein leerer Slot wird ueberall uebersprungen, ein fremder Name
-+                // fuehrt spaeter zu .at() auf einen fehlenden Schluessel.
++                // Do not keep an unresolvable render target in the material: an
++                // empty slot is skipped everywhere, while a foreign name is looked
++                // up later with .at() and throws std::out_of_range.
 +                material.textures.back().clear();
 +                continue;
              } else {
