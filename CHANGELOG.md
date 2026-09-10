@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] – 2026-09-11
+
+### Added
+- Backend `owe`: waywallen + Open Wallpaper Engine. Renders inside Plasma's
+  wallpaper layer, so desktop icons stay visible for scene, video and web
+  wallpapers — including the scene that crashed the KDE plugin. `we-wallpaper
+  backend owe` stops the own renderer, starts the daemon, enables its autostart,
+  sets `org.waywallen.kde` on every desktop, copies the `pause_on_*` settings
+  into waywallen's pause policy and applies the assigned wallpaper by Workshop
+  ID. Apply, slideshow and `next` re-apply through waywallen.
+- `we-wallpaper owe status|list|apply|pause|scan|prop|start|stop` for direct
+  control; `doctor` checks the Flatpak, the Plasma extension and the plugin.
+- `packaging/install-owe.sh`: installs the Flatpak, the Plasma extension
+  (`kpackagetool6`) and the OWE bundle with SHA-256 verification, all in the
+  user's home.
+- Dependency-free WebSocket client and Protobuf wire codec for waywallen's
+  control protocol; `share/wwproto/` documents the messages and field numbers.
+- GUI: third entry in the *Backend* box with a setup hint when something is
+  missing.
+- Tests: codec round trips, the client against an in-process fake daemon
+  (fragmented frames, pings, error responses), policy sync leaving unknown
+  settings intact, monitor-to-display planning, the backend switch with stubs.
+
+### Changed
+- In `owe` mode the pause daemon no longer freezes processes; waywallen pauses
+  on fullscreen/maximized/lock itself. The daemon forwards only the manual
+  pause (Meta+Shift+P) and keeps recording the reason for `status`.
+  Meta+Shift+W toggles waywallen's pause instead of killing a renderer.
+
 ## [0.2.3] – 2026-09-11
 
 ### Added

@@ -46,6 +46,24 @@ def conf_flag(key, default=True):
         return default
 
 
+def conf_backend():
+    try:
+        return json.loads(CONF.read_text(encoding="utf-8")).get("backend") or "native"
+    except Exception:
+        return "native"
+
+
+def owe_reason(glob, per):
+    """Im OWE-Modus gibt es keine Renderer-Prozesse: ein Grund auf irgendeinem
+    Monitor pausiert waywallen global (eine Pause fuer alle Displays)."""
+    if glob:
+        return glob[0]
+    for reasons in per.values():
+        if reasons:
+            return reasons[0]
+    return None
+
+
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
 
@@ -210,6 +228,7 @@ class Watch(QObject):
         self.all_outputs = set()          # vom KWin-Skript gemeldete Monitore
         self.frozen_pid = None
         self.manual_pause = False   # per Tastenkuerzel eingefroren
+        self.owe_paused = False     # zuletzt an waywallen gemeldete Handpause
 
     def _write_pause(self, reason):
         try:
@@ -243,11 +262,15 @@ class Watch(QObject):
     def pause_reason(self):
         """Grund fuer den ersten Renderer (fuer Log/Status) oder None."""
         glob, per = self.reasons()
+        if conf_backend() == "owe":
+            return owe_reason(glob, per)
         d = decide(renderer_map(), glob, per, span_any=conf_flag("span_pause_any", False))
         return next((r for r in d.values() if r), None)
 
     def apply(self):
         """Bringt jeden Renderer in den Zustand, den die Gruende verlangen."""
+        if conf_backend() == "owe":
+            return self.apply_owe()
         mapping = renderer_map()
         if not mapping:
             self.frozen_pid = None
@@ -270,6 +293,33 @@ class Watch(QObject):
                 any_frozen = reason
         self.frozen_pid = next((p for p, r in wanted.items() if r), None)
         self._write_pause(any_frozen)
+
+    def apply_owe(self):
+        """Im OWE-Modus pausiert waywallen Vollbild/Maximiert/Sperre selbst (die
+        Politik wird aus der Config uebertragen). Hier wird nur die manuelle Pause
+        (Tastenkuerzel) an waywallen weitergereicht - automatische Gruende werden
+        lediglich protokolliert, sonst wuerde eine im waywallen-Tray gesetzte Pause
+        beim naechsten Fensterwechsel wieder aufgehoben."""
+        import subprocess
+        glob, per = self.reasons()
+        reason = owe_reason(glob, per)
+        self._write_pause(reason)
+        wanted = self.manual_pause
+        if wanted == getattr(self, "owe_paused", None):
+            return
+        try:
+            r = subprocess.run([str(HOME / ".local/bin/we-wallpaper"), "owe", "pause",
+                                "on" if wanted else "off"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                log(f"waywallen-Pause fehlgeschlagen: {(r.stderr or r.stdout).strip()}")
+                return
+        except Exception as e:
+            log(f"waywallen-Pause fehlgeschlagen: {e}")
+            return
+        self.owe_paused = wanted
+        self.frozen_pid = None
+        log("manuell -> waywallen pausiert" if wanted else "manuell -> waywallen laeuft")
 
     @Slot(str)
     def setFullscreenOutputs(self, csv):
@@ -331,8 +381,7 @@ class Watch(QObject):
     def togglePause(self):
         """Friert den Renderer von Hand ein bzw. weckt ihn - unabhaengig
         vom Vollbild-Zustand."""
-        pid = renderer_pid()
-        if pid is None:
+        if conf_backend() != "owe" and renderer_pid() is None:
             log("Tastenkuerzel: Pause - kein Renderer")
             return
         self.manual_pause = not self.manual_pause

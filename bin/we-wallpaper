@@ -52,6 +52,7 @@ DEFAULTS = {
                  "order": "random", "index": 0},
     "renderer": "",         # Pfad zum linux-wallpaperengine-Binary; leer = Standard
     "backend": "native",    # native = linux-wallpaperengine | kde-plugin = wallpaper-engine-kde-plugin
+                            # | owe = waywallen + Open Wallpaper Engine (Desktop-Icons bleiben, alle Typen)
     "per_output": False,    # ein Renderer-Prozess je Monitor -> Pausieren pro Monitor moeglich
     "span_pause_any": False, # Span schon pausieren, wenn EIN Monitor verdeckt ist (statt alle)
     "layer": "background",  # wlr-layer-shell-Ebene: background|bottom|top|overlay
@@ -414,7 +415,7 @@ def do_run_renderer():
     Renderer, damit systemd ihn direkt ueberwacht und neu starten kann."""
     cfg = load_conf()
     if (cfg.get("backend") or "native") != "native":
-        print("Backend ist das KDE-Plugin - eigener Renderer bleibt aus", file=sys.stderr)
+        print(f"Backend ist {cfg.get('backend')} - eigener Renderer bleibt aus", file=sys.stderr)
         return 0
     args, skipped = build_args(cfg)
     for item in skipped:
@@ -600,19 +601,603 @@ def wallpaper_type(wid):
         return "scene"
 
 
+# ---------------------------------------------------------------- Backend: waywallen + Open Wallpaper Engine
+# waywallen (MIT) ist ein Wallpaper-Daemon mit Plasma-Erweiterung, die in Plasmas
+# eigener Wallpaper-Ebene rendert - Desktop-Icons bleiben sichtbar. Das Plugin
+# Open Wallpaper Engine (OWE) bringt Renderer fuer scene/video/web-Wallpaper mit.
+# Gesteuert wird ueber D-Bus (Port-Abfrage) und einen WebSocket mit Protobuf.
+# Der Codec unten ist bewusst abhaengigkeitsfrei (Fedoras python3-protobuf ist
+# zu alt fuer generierte Bindings); die Feldnummern stammen aus
+# share/wwproto/control.proto (waywallen 0.3.9).
+OWE_APP = "org.waywallen.waywallen"
+OWE_KDE_ID = "org.waywallen.kde"
+OWE_PLUGIN_ID = "org.waywallen.open-wallpaper-engine"
+OWE_URL = "https://github.com/waywallen/open-wallpaper-engine"
+OWE_BUS = ("org.waywallen.waywallen.Daemon", "/org/waywallen/waywallen/Daemon",
+           "org.waywallen.waywallen.Daemon1")
+OWE_LOG = STATE / "we-owe.log"
+OWE_PLUGIN_DIRS = [
+    HOME / f".var/app/{OWE_APP}/data/waywallen/plugins/{OWE_PLUGIN_ID}",
+    Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "waywallen/plugins" / OWE_PLUGIN_ID,
+]
+OWE_REQ = {   # Request/Response-Feldnummern (oneof payload)
+    "renderer_list": 12, "wallpaper_list": 19, "wallpaper_scan": 20, "wallpaper_apply": 22,
+    "display_list": 23, "settings_get": 24, "settings_set": 25, "wallpaper_get": 42,
+    "wallpaper_property_set": 43, "autostart_get": 65, "autostart_set": 66,
+    "global_pause_toggle": 75, "global_pause_set": 76, "global_stop_set": 78,
+}
+OWE_STATUS_OK = 1
+OWE_ACTION = {"none": 0, "mute": 1, "pause": 2, "stop": 3}
+OWE_RENDER_STATE = {1: "startet", 2: "laeuft", 3: "stoppt", 4: "gestoppt", 5: "abgeschossen", 6: "fehlgeschlagen"}
+
+
+def pb_varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _pb_read_varint(buf, i):
+    shift = n = 0
+    while True:
+        b = buf[i]
+        i += 1
+        n |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return n, i
+        shift += 7
+
+
+def pb_decode(buf):
+    """Protobuf-Bytes -> Liste (feld, wiretyp, wert). Verschachtelte Nachrichten
+    und Strings bleiben rohe Bytes; unbekannte Felder ueberleben ein Decode/Encode."""
+    fields, i, n = [], 0, len(buf)
+    while i < n:
+        key, i = _pb_read_varint(buf, i)
+        fno, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = _pb_read_varint(buf, i)
+        elif wt == 1:
+            v, i = bytes(buf[i:i + 8]), i + 8
+        elif wt == 5:
+            v, i = bytes(buf[i:i + 4]), i + 4
+        elif wt == 2:
+            ln, i = _pb_read_varint(buf, i)
+            v, i = bytes(buf[i:i + ln]), i + ln
+        else:
+            raise ValueError(f"Protobuf: unbekannter Wiretyp {wt}")
+        fields.append((fno, wt, v))
+    return fields
+
+
+def pb_encode(fields):
+    out = bytearray()
+    for fno, wt, v in fields:
+        out += pb_varint((fno << 3) | wt)
+        if wt == 0:
+            out += pb_varint(int(v))
+        elif wt == 2:
+            if isinstance(v, str):
+                v = v.encode()
+            elif isinstance(v, list):
+                v = pb_encode(v)
+            out += pb_varint(len(v)) + v
+        else:
+            out += bytes(v)
+    return bytes(out)
+
+
+def pb_get(fields, fno, default=None):
+    for f, _wt, v in fields:
+        if f == fno:
+            return v
+    return default
+
+
+def pb_all(fields, fno):
+    return [v for f, _wt, v in fields if f == fno]
+
+
+def pb_str(fields, fno, default=""):
+    v = pb_get(fields, fno)
+    return v.decode("utf-8", "replace") if isinstance(v, bytes) else default
+
+
+def pb_int(fields, fno, default=0):
+    v = pb_get(fields, fno)
+    return int(v) if isinstance(v, int) else default
+
+
+def pb_msg(fields, fno):
+    v = pb_get(fields, fno)
+    return pb_decode(v) if isinstance(v, bytes) else None
+
+
+def pb_set(fields, fno, wt, value):
+    return [f for f in fields if f[0] != fno] + [(fno, wt, value)]
+
+
+class OweSocket:
+    """Kleiner WebSocket-Client (RFC 6455, nur was der Daemon braucht)."""
+
+    def __init__(self, port, timeout=60):
+        import base64
+        import socket
+        self.s = socket.create_connection(("127.0.0.1", int(port)), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        hdr = b""
+        while b"\r\n\r\n" not in hdr:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket-Handshake abgebrochen")
+            hdr += chunk
+        head, _, self.buf = hdr.partition(b"\r\n\r\n")
+        status = head.split(b"\r\n")[0].decode(errors="replace")
+        if " 101 " not in status:
+            raise ConnectionError(f"WebSocket-Handshake: {status}")
+        self.seq = 0
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise ConnectionError("waywallen hat die Verbindung geschlossen")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, payload):
+        import struct
+        mask = os.urandom(4)
+        ln = len(payload)
+        if ln < 126:
+            hdr = bytes([0x82, 0x80 | ln])
+        elif ln < 65536:
+            hdr = bytes([0x82, 0x80 | 126]) + struct.pack(">H", ln)
+        else:
+            hdr = bytes([0x82, 0x80 | 127]) + struct.pack(">Q", ln)
+        self.s.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def recv(self):
+        import struct
+        message = b""
+        while True:
+            b0, b1 = self._read(2)
+            fin, op, ln = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._read(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b1 & 0x80 else None
+            data = self._read(ln)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if op == 8:
+                raise ConnectionError("waywallen hat die Verbindung geschlossen")
+            if op == 9:      # Ping -> Pong
+                self.s.sendall(bytes([0x8A, 0x80 | len(data)]) + b"\0\0\0\0" + data)
+                continue
+            if op == 10:
+                continue
+            message += data
+            if fin:
+                return message
+        return message
+
+    def call(self, name, payload=b""):
+        """Sendet Request{request_id, <name>: payload} und liefert die Antwort-
+        Nutzlast als dekodierte Feldliste; Fehler des Daemons werden geworfen."""
+        self.seq += 1
+        rid = self.seq
+        self.send(pb_encode([(1, 0, rid), (OWE_REQ[name], 2, payload)]))
+        while True:
+            frame = pb_decode(self.recv())
+            resp = pb_msg(frame, 1)          # ServerFrame.response (2 = Event)
+            if resp is None or pb_int(resp, 1) != rid:
+                continue
+            if pb_int(resp, 2) != OWE_STATUS_OK:
+                raise RuntimeError(f"waywallen {name}: {pb_str(resp, 3) or 'Fehler'} "
+                                   f"(status {pb_int(resp, 2)}, code {pb_int(resp, 4)})")
+            return pb_msg(resp, OWE_REQ[name]) or []
+
+
+def owe_flatpak_installed():
+    return any((base / "app" / OWE_APP / "current/active/metadata").is_file()
+               for base in (HOME / ".local/share/flatpak", Path("/var/lib/flatpak")))
+
+
+def owe_kde_installed():
+    return any((root / OWE_KDE_ID / "metadata.json").is_file() for root in KDE_PLUGIN_ROOTS)
+
+
+def owe_plugin_dir():
+    for d in OWE_PLUGIN_DIRS:
+        if (d / "bin/waywallen-wescene-renderer").is_file():
+            return d
+    return None
+
+
+def owe_installer():
+    """Pfad des Einrichtungsskripts: Repo, ~/.local/share oder RPM."""
+    here = Path(__file__).resolve().parent.parent / "packaging/install-owe.sh"
+    for p in (here, HOME / ".local/share/we-wallpaper/install-owe.sh",
+              Path("/usr/share/we-wallpaper/install-owe.sh")):
+        if p.is_file():
+            return str(p)
+    return "packaging/install-owe.sh"
+
+
+def owe_missing():
+    """Was fuer das OWE-Backend fehlt - Liste von (Text, Hinweis)."""
+    out = []
+    inst = owe_installer()
+    if not owe_flatpak_installed():
+        out.append(("waywallen (Flatpak org.waywallen.waywallen)",
+                    f"{inst}  (oder: flatpak install --user flathub org.waywallen.waywallen)"))
+    if not owe_kde_installed():
+        out.append(("Plasma-Erweiterung org.waywallen.kde",
+                    f"{inst}  (holt waywallen-kde von GitHub und installiert es per kpackagetool6)"))
+    if not owe_plugin_dir():
+        out.append(("Plugin Open Wallpaper Engine",
+                    f"{inst}  (entpackt das Bundle von {OWE_URL} nach ~/.var/app/{OWE_APP}/data/waywallen/plugins/)"))
+    return out
+
+
+def owe_bus_prop(name):
+    """Liest eine D-Bus-Property des Daemons; None wenn er nicht laeuft."""
+    try:
+        r = subprocess.run(["busctl", "--user", "get-property", *OWE_BUS, name],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    typ, _, val = r.stdout.strip().partition(" ")
+    if typ == "s":
+        return val.strip('"')
+    if typ in ("u", "i", "t", "x", "q", "n", "y"):
+        return int(val)
+    return val
+
+
+def owe_running():
+    return owe_bus_prop("WsPort") is not None
+
+
+def owe_start_daemon(wait=30):
+    if owe_running():
+        return True
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(OWE_LOG, "a") as lf:
+        subprocess.Popen(["flatpak", "run", "--command=waywallen", OWE_APP, "--no-ui"],
+                         stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(wait * 2):
+        time.sleep(0.5)
+        if owe_running():
+            time.sleep(2)   # Display-Registrierung der Plasma-Erweiterung abwarten
+            return True
+    return False
+
+
+def owe_connect():
+    port = owe_bus_prop("WsPort")
+    if port is None:
+        raise RuntimeError("waywallen-Daemon laeuft nicht (we-wallpaper owe start)")
+    return OweSocket(port)
+
+
+def owe_catalog(ws):
+    """Alle Wallpaper, die waywallen kennt - mit Workshop-ID (external_id)."""
+    out, page = [], 0
+    while True:
+        r = ws.call("wallpaper_list", pb_encode([(2, 0, page), (3, 0, 200)]))
+        entries = [pb_decode(x) for x in pb_all(r, 1)]
+        if not entries:
+            break
+        for e in entries:
+            out.append({"id": pb_str(e, 1), "name": pb_str(e, 2), "type": pb_str(e, 3),
+                        "resource": pb_str(e, 4), "preview": pb_str(e, 5),
+                        "width": pb_int(e, 8), "height": pb_int(e, 9), "workshop": pb_str(e, 15)})
+        if len(out) >= pb_int(r, 2):
+            break
+        page += 1
+    return out
+
+
+def owe_find(catalog, wid):
+    wid = str(wid)
+    for e in catalog:
+        if e["workshop"] == wid or f"/{wid}/" in e["resource"] + "/":
+            return e
+    return None
+
+
+def owe_displays(ws):
+    r = ws.call("display_list")
+    return [{"id": pb_int(d, 1), "name": pb_str(d, 2), "w": pb_int(d, 3), "h": pb_int(d, 4)}
+            for d in (pb_decode(x) for x in pb_all(r, 1))]
+
+
+def output_sizes():
+    """{Ausgabename: (Breite, Hoehe)} der aktiven Monitore per kscreen-doctor."""
+    try:
+        r = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    out = {}
+    for o in data.get("outputs", []):
+        if not o.get("enabled"):
+            continue
+        mode = next((m for m in o.get("modes", []) if m.get("id") == o.get("currentModeId")), None)
+        size = (mode or {}).get("size") or {}
+        if size:
+            out[o.get("name")] = (int(size.get("width", 0)), int(size.get("height", 0)))
+    return out
+
+
+def owe_plan(cfg, displays, sizes):
+    """Reine Zuordnung Monitor-Config -> waywallen-Displays: {display_id: workshop_id}.
+    Gleiche Aufloesung entscheidet; bleibt etwas unzugeordnet, bekommt es das
+    erste zugewiesene Wallpaper (waywallen benennt Displays nicht nach Ausgang)."""
+    screens = {n: str(sc.get("id")) for n, sc in sorted((cfg.get("screens") or {}).items())
+               if str(sc.get("id") or "").isdigit()}
+    plan, used = {}, set()
+    for name, wid in screens.items():
+        size = sizes.get(name)
+        d = next((d for d in displays if d["id"] not in used and size and (d["w"], d["h"]) == size), None)
+        if d:
+            plan[d["id"]] = wid
+            used.add(d["id"])
+    first = next(iter(screens.values()), None)
+    for d in displays:
+        if d["id"] not in plan and first:
+            plan[d["id"]] = first
+    return plan
+
+
+def owe_apply_plan(ws, plan, catalog=None):
+    """Wendet einen Plan an; liefert [(workshop_id, katalogname, [display_ids])]."""
+    catalog = catalog if catalog is not None else owe_catalog(ws)
+    by_wid = {}
+    for did, wid in plan.items():
+        by_wid.setdefault(wid, []).append(did)
+    done = []
+    for wid, dids in by_wid.items():
+        entry = owe_find(catalog, wid)
+        if entry is None:
+            ws.call("wallpaper_scan")
+            catalog = owe_catalog(ws)
+            entry = owe_find(catalog, wid)
+        if entry is None:
+            raise RuntimeError(f"Wallpaper {wid} ({title_of(wid)}) ist waywallen unbekannt - "
+                               "in der waywallen-UI die Steam-Workshop-Quelle hinzufuegen")
+        payload = [(1, 2, entry["id"])] + [(5, 2, pb_encode([(1, 0, did)])) for did in dids]
+        ws.call("wallpaper_apply", pb_encode(payload))
+        done.append((wid, entry["name"], dids))
+    return done
+
+
+def owe_apply(cfg, ws=None):
+    ws = ws or owe_connect()
+    displays = owe_displays(ws)
+    if not displays:
+        raise RuntimeError("waywallen meldet kein Display - ist das Plasma-Wallpaper auf "
+                           f"{OWE_KDE_ID} gestellt? (we-wallpaper backend owe)")
+    plan = owe_plan(cfg, displays, output_sizes())
+    if not plan:
+        raise RuntimeError("kein Wallpaper zugewiesen - erst in der GUI zuweisen")
+    return owe_apply_plan(ws, plan)
+
+
+def owe_pause(paused, ws=None):
+    ws = ws or owe_connect()
+    ws.call("global_pause_set", pb_encode([(1, 0, 1 if paused else 0)]))
+
+
+def owe_sync_policy(cfg, ws=None):
+    """Uebertraegt pause_on_* in waywallens auto_replay-Politik (Vollbild=13,
+    Maximiert=12, Sperre=14); alle anderen Einstellungen bleiben unangetastet."""
+    ws = ws or owe_connect()
+    sg = ws.call("settings_get")
+    g = pb_msg(sg, 1) or []
+    plugins = [(2, 2, p) for p in pb_all(sg, 2)]
+    ar = pb_msg(g, 16) or []
+    for fno, key in ((13, "pause_on_fullscreen"), (12, "pause_on_maximized"), (14, "pause_on_lock")):
+        ar = pb_set(ar, fno, 0, OWE_ACTION["pause"] if cfg.get(key, True) else OWE_ACTION["none"])
+    g = pb_set(g, 16, 2, pb_encode(ar))
+    ws.call("settings_set", pb_encode([(1, 2, pb_encode(g))] + plugins))
+
+
+def owe_renderers(ws):
+    r = ws.call("renderer_list")
+    out = []
+    for inst in (pb_decode(x) for x in pb_all(r, 2)):
+        state = pb_msg(inst, 17) or []
+        kind = state[0][0] if state else 0
+        out.append({"id": pb_str(inst, 1), "name": pb_str(inst, 4), "pid": pb_int(inst, 5),
+                    "fps": pb_int(inst, 2), "state": OWE_RENDER_STATE.get(kind, "?")})
+    return out
+
+
+def build_owe_script():
+    return (f'for (const d of desktops()) {{ d.wallpaperPlugin = {_js_str(OWE_KDE_ID)}; }}\n'
+            f'print("owe ok");')
+
+
+def owe_status_lines(cfg):
+    lines = []
+    if not owe_running():
+        lines.append("waywallen: laeuft nicht  (we-wallpaper owe start)")
+        return lines
+    lines.append(f"waywallen {owe_bus_prop('Version')} laeuft, WebSocket-Port {owe_bus_prop('WsPort')}")
+    try:
+        ws = owe_connect()
+        try:
+            catalog = owe_catalog(ws)
+            cur = str(owe_bus_prop("CurrentWallpaperId") or "")
+            entry = next((e for e in catalog if e["id"] == cur), None)
+            lines.append("aktuell: " + (f"{entry['name']} [{entry['type']}] "
+                                        f"(Workshop {entry['workshop'] or '-'})" if entry else "-"))
+            for r in owe_renderers(ws):
+                lines.append(f"Renderer {r['name']} PID {r['pid']}: {r['state']}, {r['fps']} fps")
+            lines.append(f"Katalog: {len(catalog)} Wallpaper, {len(owe_displays(ws))} Display(s)")
+        finally:
+            ws.close()
+    except (OSError, RuntimeError) as e:
+        lines.append(f"Steuerkanal: {e}")
+    return lines
+
+
+def do_owe(args):
+    """Direkte Steuerung von waywallen: we-wallpaper owe <Befehl>."""
+    cfg = load_conf()
+    cmd = args[0] if args else "status"
+    if cmd == "start":
+        ok = owe_start_daemon()
+        print("waywallen laeuft" if ok else f"waywallen startet nicht - siehe {OWE_LOG}")
+        return 0 if ok else 1
+    if cmd == "stop":
+        subprocess.run(["flatpak", "kill", OWE_APP], capture_output=True)
+        print("waywallen beendet")
+        return 0
+    if cmd == "status":
+        for line in owe_status_lines(cfg):
+            print(line)
+        return 0
+    try:
+        ws = owe_connect()
+    except (OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    try:
+        if cmd == "list":
+            for e in owe_catalog(ws):
+                print(f"{e['id']:>4}  {e['type']:<6} {e['workshop'] or '-':<11} {e['name']}")
+            return 0
+        if cmd == "scan":
+            r = ws.call("wallpaper_scan")
+            print(f"{pb_int(r, 1)} Wallpaper gefunden")
+            return 0
+        if cmd == "apply":
+            if len(args) > 1:
+                dids = [d["id"] for d in owe_displays(ws)]
+                done = owe_apply_plan(ws, {d: str(args[1]) for d in dids})
+            else:
+                done = owe_apply(cfg, ws)
+            for wid, name, dids in done:
+                print(f"{name} (Workshop {wid}) auf Display {', '.join(map(str, dids))}")
+            return 0
+        if cmd == "pause":
+            what = args[1] if len(args) > 1 else "toggle"
+            if what == "toggle":
+                ws.call("global_pause_toggle")
+            else:
+                owe_pause(what in ("on", "1", "true", "an"), ws)
+            print("ok")
+            return 0
+        if cmd == "policy":
+            owe_sync_policy(cfg, ws)
+            print("Pausen-Politik uebertragen")
+            return 0
+        if cmd == "prop" and len(args) >= 4:
+            entry = owe_find(owe_catalog(ws), args[1])
+            if entry is None:
+                print(f"Wallpaper {args[1]} unbekannt", file=sys.stderr)
+                return 1
+            ws.call("wallpaper_property_set", pb_encode([(1, 2, entry["id"]), (2, 2, args[2]), (3, 2, args[3])]))
+            print("ok")
+            return 0
+        print("Aufruf: we-wallpaper owe status|start|stop|list|scan|apply [Workshop-ID]"
+              "|pause [on|off|toggle]|policy|prop <Workshop-ID> <Schluessel> <Wert>", file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    finally:
+        ws.close()
+
+
+def owe_leave():
+    """Autostart von waywallen abschalten und den Daemon beenden."""
+    try:
+        ws = owe_connect()
+        try:
+            ws.call("autostart_set", pb_encode([(1, 0, 0)]))
+        finally:
+            ws.close()
+    except (OSError, RuntimeError):
+        pass
+    subprocess.run(["flatpak", "kill", OWE_APP], capture_output=True)
+
+
 def do_backend(target=None, force=False):
     cfg = load_conf()
     if target is None:
         cur = cfg.get("backend") or "native"
         print(f"aktiv: {cur}")
         print(f"KDE-Plugin installiert: {'ja' if kde_plugin_installed() else 'nein'}")
+        print(f"OWE (waywallen) einsatzbereit: {'ja' if not owe_missing() else 'nein'}")
         plugs = current_wallpaper_plugins()
         if plugs:
             print("Plasma-Wallpaper-Plugins: " + ", ".join(f"{k}={v}" for k, v in plugs.items()))
         return 0
-    if target not in ("native", "kde-plugin"):
-        print("Aufruf: we-wallpaper backend [native|kde-plugin]", file=sys.stderr)
+    if target not in ("native", "kde-plugin", "owe"):
+        print("Aufruf: we-wallpaper backend [native|kde-plugin|owe]", file=sys.stderr)
         return 1
+    previous = cfg.get("backend") or "native"
+    if target == "owe":
+        missing = owe_missing()
+        if missing:
+            print("Fuer das OWE-Backend fehlt:", file=sys.stderr)
+            for text, hint in missing:
+                print(f"  - {text}\n      -> {hint}", file=sys.stderr)
+            return 2
+        do_stop(quiet=True)
+        if service_enabled():
+            systemctl("disable", "--now", UNIT_RENDER)
+        if not owe_start_daemon():
+            print(f"waywallen startet nicht - siehe {OWE_LOG}", file=sys.stderr)
+            return 1
+        try:
+            out = plasma_script(build_owe_script())
+        except Exception as e:      # noqa: BLE001 - Plasma-Fehler nur melden
+            out = f"Plasma nicht erreichbar: {e}"
+        cfg["backend"] = "owe"
+        save_conf(cfg)
+        try:
+            ws = owe_connect()
+            try:
+                ws.call("autostart_set", pb_encode([(1, 0, 1)]))
+                owe_sync_policy(cfg, ws)
+                time.sleep(1)
+                done = owe_apply(cfg, ws)
+            finally:
+                ws.close()
+        except (OSError, RuntimeError) as e:
+            print(f"OWE aktiv, aber: {e}", file=sys.stderr)
+            return 1
+        if service_installed() and cfg.get("pause_on_fullscreen"):
+            systemctl("enable", "--now", UNIT_WATCH)
+        for wid, name, dids in done:
+            print(f"OWE: {name} (Workshop {wid}) auf Display {', '.join(map(str, dids))}")
+        print(f"Plasma: {out}")
+        return 0
     if target == "kde-plugin":
         if not kde_plugin_installed():
             print("wallpaper-engine-kde-plugin ist nicht installiert.\n"
@@ -637,12 +1222,16 @@ def do_backend(target=None, force=False):
         do_stop(quiet=True)
         if service_enabled():
             systemctl("disable", "--now", UNIT_RENDER, UNIT_WATCH)
+        if previous == "owe":
+            owe_leave()
         out = plasma_script(build_kde_plugin_script(cfg, wid))
         cfg["backend"] = "kde-plugin"
         save_conf(cfg)
         print(f"KDE-Plugin aktiv mit Wallpaper {wid} ({title_of(wid)}) - Plasma: {out}")
         return 0
     # zurueck auf den eigenen Renderer
+    if previous == "owe":
+        owe_leave()
     try:
         out = plasma_script(build_native_restore_script())
     except Exception as e:
@@ -761,6 +1350,26 @@ def spawn(cfg):
 
 def do_start():
     cfg = load_conf()
+    if (cfg.get("backend") or "native") == "owe":
+        if not owe_start_daemon():
+            print(f"waywallen startet nicht - siehe {OWE_LOG}", file=sys.stderr)
+            return 1
+        try:
+            ws = owe_connect()
+            try:
+                owe_sync_policy(cfg, ws)
+                done = owe_apply(cfg, ws)
+            finally:
+                ws.close()
+        except (OSError, RuntimeError) as e:
+            print(e, file=sys.stderr)
+            return 1
+        for wid, name, dids in done:
+            print(f"OWE: {name} (Workshop {wid}) auf Display {', '.join(map(str, dids))}")
+        if service_installed():
+            systemctl("restart", UNIT_WATCH) if cfg.get("pause_on_fullscreen") \
+                else systemctl("stop", UNIT_WATCH)
+        return do_status()
     if service_enabled():
         systemctl("restart", UNIT_RENDER)
         systemctl("restart", UNIT_WATCH) if cfg.get("pause_on_fullscreen") \
@@ -803,6 +1412,12 @@ def do_rotate_daemon():
             return
         if not advance_rotation(cfg):
             return
+        if (cfg.get("backend") or "native") == "owe":
+            try:
+                owe_apply(load_conf())
+            except (OSError, RuntimeError) as e:
+                print(f"Diashow: {e}", file=sys.stderr)
+            continue
         if service_enabled():
             systemctl("restart", UNIT_RENDER)
         else:
@@ -890,6 +1505,18 @@ def do_toggle():
     auch die Watcher-Unit stoppen, brachte sich der Aufrufer mitten in der
     Aktion selbst um und liesse verwaiste Renderer zurueck.
     """
+    if (load_conf().get("backend") or "native") == "owe":
+        try:
+            ws = owe_connect()
+            try:
+                ws.call("global_pause_toggle")
+            finally:
+                ws.close()
+        except (OSError, RuntimeError) as e:
+            print(e, file=sys.stderr)
+            return 1
+        print("Wallpaper-Pause umgeschaltet")
+        return 0
     running = read_pid(PIDFILE) is not None or bool(stray_pids())
     if running:
         if service_enabled():
@@ -924,6 +1551,13 @@ def do_next():
     if not advance_rotation(cfg):
         print("Diashow-Pool braucht mindestens zwei Wallpaper", file=sys.stderr)
         return 1
+    if (cfg.get("backend") or "native") == "owe":
+        try:
+            owe_apply(load_conf())
+        except (OSError, RuntimeError) as e:
+            print(e, file=sys.stderr)
+            return 1
+        return do_status()
     if service_enabled():
         systemctl("restart", UNIT_RENDER)
         time.sleep(4)
@@ -936,6 +1570,12 @@ def do_next():
 
 def do_status():
     cfg = load_conf()
+    if (cfg.get("backend") or "native") == "owe":
+        print("Backend: waywallen + Open Wallpaper Engine (Desktop-Icons sichtbar)")
+        for line in owe_status_lines(cfg):
+            print("  " + line)
+        print(f"  Watcher: {'aktiv' if unit_active(UNIT_WATCH) else 'aus'}")
+        return 0
     rescue_frozen()
     pid = read_pid(PIDFILE)
     avail = enabled_outputs()
@@ -1044,10 +1684,18 @@ def do_doctor():
     screens = cfg.get("screens") or {}
     add(bool(screens), f"zugewiesene Monitore: {', '.join(sorted(screens)) or 'keine'}",
         "In der GUI ein Wallpaper einem Monitor zuweisen und 'Anwenden'.")
-    add(service_enabled(), "als systemd-Dienst eingerichtet (empfohlen)",
+    owe_mode = (cfg.get("backend") or "native") == "owe"
+    add(service_installed() if owe_mode else service_enabled(),
+        "als systemd-Dienst eingerichtet (empfohlen)" + (" - im OWE-Modus laeuft nur der Watcher" if owe_mode else ""),
         "we-wallpaper install-service")
     add(kde_plugin_installed(), "wallpaper-engine-kde-plugin (optional, fuer Desktop-Icons; video/web)",
         f"Optionales Backend; behaelt Desktop-Icons. packaging/build-kde-plugin.sh oder {KDE_PLUGIN_URL}")
+    add(owe_flatpak_installed(), "waywallen (Flatpak; optional, Backend 'owe' mit Desktop-Icons fuer alle Typen)",
+        "flatpak install --user flathub org.waywallen.waywallen")
+    if owe_flatpak_installed():
+        add(owe_kde_installed(), f"Plasma-Erweiterung {OWE_KDE_ID}", owe_installer())
+        add(owe_plugin_dir() is not None, "Plugin Open Wallpaper Engine (Renderer fuer scene/video/web)",
+            f"{owe_installer()}  ({OWE_URL})")
     if kde_plugin_installed():
         qml_ws = Path("/usr/lib64/qt6/qml/QtWebSockets/qmldir")
         add(qml_ws.is_file(), "QML-Modul QtWebSockets (das Plugin laedt sonst nicht)",
@@ -1100,6 +1748,8 @@ def main():
         return do_profile(sys.argv[2])
     if action == "toggle":
         return do_toggle()
+    if action == "owe":
+        return do_owe(sys.argv[2:])
     if action == "next":
         return do_next()
     if action == "thaw":
@@ -1109,7 +1759,7 @@ def main():
         print(f"Renderer {', '.join(map(str, frozen))} aufgeweckt" if frozen else "nichts eingefroren")
         return 0
     print("Aufruf: we-wallpaper doctor|backend|start|stop|restart|status|list|thaw|profile|profiles"
-          "|next|toggle|install-service|uninstall-service",
+          "|next|toggle|owe|install-service|uninstall-service",
           file=sys.stderr)
     return 1
 

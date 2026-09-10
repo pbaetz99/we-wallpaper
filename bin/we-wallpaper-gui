@@ -128,6 +128,13 @@ STRINGS = {
     "Backend": "Backend",
     "eigener Renderer (linux-wallpaperengine)": "own renderer (linux-wallpaperengine)",
     "KDE-Plugin (Desktop-Icons bleiben sichtbar)": "KDE plugin (keeps desktop icons)",
+    "waywallen + Open Wallpaper Engine (Icons bleiben; scene/video/web)":
+        "waywallen + Open Wallpaper Engine (keeps icons; scene/video/web)",
+    "aktiv: waywallen + OWE": "active: waywallen + OWE",
+    "OWE einsatzbereit": "OWE ready", "OWE nicht eingerichtet": "OWE not set up",
+    "OWE nicht eingerichtet": "OWE not set up",
+    "Für das OWE-Backend fehlt etwas. Das Einrichtungsskript install-owe.sh holt alles:\n\n":
+        "Something is missing for the OWE backend. The setup script install-owe.sh fetches everything:\n\n",
     "Wechseln": "Switch",
     "Plugin installiert": "plugin installed", "Plugin nicht installiert": "plugin not installed",
     "aktiv: eigener Renderer": "active: own renderer", "aktiv: KDE-Plugin": "active: KDE plugin",
@@ -168,6 +175,17 @@ def kde_plugin_dir():
             if d.is_dir() and "wallpaperenginekde" in d.name.lower() and (d / "metadata.json").is_file():
                 return d
     return None
+
+
+def owe_ready():
+    """waywallen (Flatpak), Plasma-Erweiterung und OWE-Plugin vorhanden?"""
+    app = "org.waywallen.waywallen"
+    flat = any((b / "app" / app / "current/active/metadata").is_file()
+               for b in (HOME / ".local/share/flatpak", Path("/var/lib/flatpak")))
+    kde = any((r / "org.waywallen.kde/metadata.json").is_file() for r in KDE_PLUGIN_ROOTS)
+    plug = (HOME / f".var/app/{app}/data/waywallen/plugins/org.waywallen.open-wallpaper-engine"
+            / "bin/waywallen-wescene-renderer").is_file()
+    return flat and kde and plug
 
 
 def kde_plugin_installed():
@@ -903,10 +921,12 @@ class Window(QMainWindow):
         self.backend_box = QComboBox()
         self.backend_box.addItem(_("eigener Renderer (linux-wallpaperengine)"), "native")
         self.backend_box.addItem(_("KDE-Plugin (Desktop-Icons bleiben sichtbar)"), "kde-plugin")
+        self.backend_box.addItem(_("waywallen + Open Wallpaper Engine (Icons bleiben; scene/video/web)"), "owe")
         self.backend_box.setToolTip(_(
-            "Wechselt zwischen dem eigenen Renderer (Layer-Shell, verdeckt Desktop-Icons)\n"
-            "und dem wallpaper-engine-kde-plugin, das innerhalb von Plasmas Wallpaper-Ebene\n"
-            "rendert und die Icons sichtbar laesst. Der jeweils andere Weg wird gestoppt."))
+            "Wechselt zwischen dem eigenen Renderer (Layer-Shell, verdeckt Desktop-Icons),\n"
+            "dem wallpaper-engine-kde-plugin (video/web) und waywallen mit Open Wallpaper\n"
+            "Engine, das in Plasmas Wallpaper-Ebene rendert und alle Typen beherrscht.\n"
+            "Der jeweils andere Weg wird gestoppt."))
         bv.addWidget(self.backend_box)
         self.backend_info = QLabel()
         self.backend_info.setObjectName("Muted")
@@ -1483,9 +1503,12 @@ class Window(QMainWindow):
             self.backend_box.setCurrentIndex(i)
             self.backend_box.blockSignals(False)
         inst = kde_plugin_installed()
+        owe = owe_ready()
+        label = {"kde-plugin": _("aktiv: KDE-Plugin"), "owe": _("aktiv: waywallen + OWE")}.get(
+            cur, _("aktiv: eigener Renderer"))
         self.backend_info.setText(
-            (_("aktiv: KDE-Plugin") if cur == "kde-plugin" else _("aktiv: eigener Renderer"))
-            + "  ·  " + (_("Plugin installiert") if inst else _("Plugin nicht installiert")))
+            label + "  ·  " + (_("Plugin installiert") if inst else _("Plugin nicht installiert"))
+            + "  ·  " + (_("OWE einsatzbereit") if owe else _("OWE nicht eingerichtet")))
 
     def on_backend_switch(self):
         target = self.backend_box.currentData()
@@ -1512,6 +1535,11 @@ class Window(QMainWindow):
                                capture_output=True, text=True)
             if r.returncode == 3:
                 QMessageBox.warning(self, _("Wechsel abgelehnt"), (r.stderr or r.stdout).strip()[:800])
+            elif r.returncode == 2 and target == "owe":
+                QMessageBox.information(
+                    self, _("OWE nicht eingerichtet"),
+                    _("Für das OWE-Backend fehlt etwas. Das Einrichtungsskript install-owe.sh holt alles:\n\n")
+                    + (r.stderr or r.stdout).strip()[:800])
             elif r.returncode != 0:
                 QMessageBox.critical(self, _("Fehler"), (r.stderr or r.stdout).strip()[:600])
         except Exception as e:

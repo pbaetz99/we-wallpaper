@@ -17,6 +17,7 @@ if [ ${#miss[@]} -gt 0 ]; then printf 'Fehlt: %s\n' "${miss[@]}"; exit 1; fi
 mkdir -p "$BIN" "$SHARE" "$APPS" "$UNITS"
 install -m 755 "$HERE"/bin/we-wallpaper "$HERE"/bin/we-wallpaper-gui "$HERE"/bin/we-wallpaper-watch "$BIN/"
 install -m 644 "$HERE"/share/fullscreen-watch.js "$SHARE/"
+install -m 755 "$HERE"/packaging/install-owe.sh "$SHARE/"
 sed "s|^Exec=.*|Exec=$BIN/we-wallpaper-gui|" "$HERE/desktop/we-wallpaper-gui.desktop" > "$APPS/we-wallpaper-gui.desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 

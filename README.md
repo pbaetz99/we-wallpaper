@@ -8,8 +8,13 @@ properties editor, per-monitor assignment, profiles, a slideshow, global
 shortcuts, and — most importantly — **automatic pausing** so the renderer stops
 burning GPU power whenever nobody can see the wallpaper.
 
-Built on [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
-by Almamu, which does the actual rendering. This project only drives it.
+Three rendering backends, switchable in the GUI: the own renderer built on
+[linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine),
+[wallpaper-engine-kde-plugin](https://github.com/catsout/wallpaper-engine-kde-plugin),
+and — new in 0.3 — [waywallen](https://github.com/waywallen/waywallen) with
+[Open Wallpaper Engine](https://github.com/waywallen/open-wallpaper-engine),
+which renders inside Plasma's own wallpaper layer, so **desktop icons stay
+visible for scene, video and web wallpapers**. This project only drives them.
 
 > **Status:** built for one machine (Nobara 44, Plasma 6.7 on Wayland, NVIDIA
 > RTX 4080, a 32:9 ultrawide plus a 4K second monitor). Every feature below
@@ -31,22 +36,61 @@ The wallpaper is invisible while the screen is locked, while a game runs
 fullscreen, or while a maximized window covers every monitor. `we-wallpaper-watch`
 freezes the renderer in exactly those situations and thaws it afterwards.
 
-## Two backends — pick one
+## Three backends — pick one
 
-| | own renderer (`linux-wallpaperengine`) | KDE plugin (`wallpaper-engine-kde-plugin`) |
-|---|---|---|
-| desktop icons | **hidden** (layer-shell surface sits above Plasma's desktop, on every `--layer`) | visible |
-| per-wallpaper properties, live preview, profiles, slideshow | yes | properties via the plugin's own dialog |
-| automatic pausing (fullscreen / lock / maximized) | yes, with ~19 W GPU saved | the plugin's own pause modes |
-| global shortcuts Meta+Shift+W/N/P | yes | — |
-| rendering | scene, video, web | **video and web** (verified here); scene wallpapers crashed plasmashell with the plugin's scene backend, so the switch refuses them unless forced |
+| | own renderer (`linux-wallpaperengine`) | KDE plugin (`wallpaper-engine-kde-plugin`) | **waywallen + Open Wallpaper Engine** (`owe`) |
+|---|---|---|---|
+| desktop icons | **hidden** (layer-shell surface sits above Plasma's desktop, on every `--layer`) | visible | **visible** (renders inside Plasma's wallpaper layer) |
+| rendering | scene, video, web | video and web (its scene backend crashed plasmashell; refused unless forced) | **scene, video, web** — the scene that broke the KDE plugin renders fine here |
+| per-wallpaper properties, live preview, profiles, slideshow | yes | properties via the plugin's own dialog | slideshow and profiles yes; properties forwarded to waywallen (`we-wallpaper owe prop`) |
+| automatic pausing (fullscreen / lock / maximized) | yes, with ~19 W GPU saved | the plugin's own pause modes | waywallen's own policy, set from your `pause_on_*` config |
+| global shortcuts Meta+Shift+W/N/P | yes | — | yes (W and P toggle waywallen's pause) |
+| multi-monitor | per output and spans | per desktop | per display, matched by resolution; no spans |
+| GPU with the Blue Nebula scene | ~53 W at 30 fps | — | ~51 W, ~47 W paused (the rest is Plasma compositing) |
 
 Switch in the GUI (*Backend* box) or on the command line:
 
 ```bash
 we-wallpaper backend            # show which one is active
+we-wallpaper backend owe        # waywallen + OWE: icons stay, every wallpaper type
 we-wallpaper backend kde-plugin # stop own renderer, activate the plugin with the assigned wallpaper
 we-wallpaper backend native     # back to the own renderer
+```
+
+### waywallen + Open Wallpaper Engine
+
+```bash
+packaging/install-owe.sh        # Flatpak from Flathub, Plasma extension, OWE bundle (~150 MB), then switches
+```
+
+The script installs everything into your home (no root): the
+`org.waywallen.waywallen` Flatpak, the `org.waywallen.kde` Plasma wallpaper
+extension via `kpackagetool6`, and the OWE plugin bundle into the Flatpak's
+plugin directory, verifying the SHA-256 of both downloads. It restarts
+plasmashell once so the QML extension is picked up.
+
+`we-wallpaper backend owe` then stops the own renderer, starts the daemon if
+needed, enables its autostart (through the XDG background portal), sets every
+desktop's wallpaper plugin to `org.waywallen.kde`, copies your
+`pause_on_fullscreen/maximized/lock` settings into waywallen's pause policy,
+and applies the wallpaper you assigned — looked up in waywallen's catalogue by
+its Workshop ID. The GUI's *Apply* button, the slideshow and `we-wallpaper next`
+keep working; they re-apply through waywallen.
+
+In this mode the pause daemon does not freeze anything itself: waywallen pauses
+its renderer on fullscreen, maximized and locked screens. The daemon only keeps
+the shortcuts (Meta+Shift+P forwards the manual pause) and records the reason
+for `status`. Talking to waywallen needs no extra Python packages — the control
+script speaks its WebSocket/Protobuf protocol with a small built-in codec
+(field numbers documented in `share/wwproto/`).
+
+```bash
+we-wallpaper owe status               # daemon version, current wallpaper, renderers
+we-wallpaper owe list                  # waywallen's catalogue with Workshop IDs
+we-wallpaper owe apply [workshop-id]   # re-apply the config, or one wallpaper on every display
+we-wallpaper owe pause [on|off|toggle]
+we-wallpaper owe scan                  # rescan the library after subscribing to new wallpapers
+we-wallpaper owe prop <workshop-id> <key> <value>
 ```
 
 Switching uses Plasma's scripting interface (`org.kde.PlasmaShell
@@ -98,8 +142,10 @@ installed") — `we-wallpaper doctor` checks for it.
 | `bin/we-wallpaper-gui` | PySide6 application: library grid, filters, favourites, properties editor, live preview, profiles, tray icon |
 | `bin/we-wallpaper-watch` | pause daemon: freezes the renderer on fullscreen / lock / maximized / manual; owns the KWin script and the global shortcuts |
 | `share/fullscreen-watch.js` | KWin script: detects fullscreen and maximized windows, registers the shortcuts, reports over D-Bus |
+| `share/wwproto/` | waywallen's `control.proto` (MIT) for reference — the control script implements the few messages it needs by field number |
+| `packaging/install-owe.sh` | installs waywallen, its Plasma extension and Open Wallpaper Engine into the user's home, then switches to the `owe` backend |
 | `systemd/*.service` | user units (auto-restart on crash, bound to the Plasma session) |
-| `packaging/` | RPM spec, `build-rpm.sh`, and `build-kde-plugin.sh` (builds the KDE plugin from one source tree) |
+| `packaging/` | RPM spec, `build-rpm.sh`, `build-kde-plugin.sh` (builds the KDE plugin from one source tree), `install-owe.sh` |
 | `tests/` | unit tests (`tests/run.sh`), run by CI on every push |
 | `contrib/we-ambient-guard` | unrelated to wallpapers: works around an OpenRGB Effects-plugin deadlock and duplicate OpenRGB starts; see below |
 
@@ -114,6 +160,8 @@ installed") — `we-wallpaper doctor` checks for it.
   `~/.local/share/Steam/steamapps/workshop/content/431960/`.
 - Python 3 with `PySide6` (Fedora: `python3-pyside6`), `kscreen-doctor`,
   `ffprobe` (for real video resolutions).
+- For the `owe` backend: `flatpak`, `kpackagetool6`, `unzip`, `curl` —
+  `packaging/install-owe.sh` fetches the rest.
 
 ## Install
 
@@ -146,8 +194,9 @@ twice. `we-wallpaper uninstall-service` reverts it.
 ```
 we-wallpaper doctor            # prerequisites check with hints
 we-wallpaper start|stop|restart|status|list
-we-wallpaper backend [native|kde-plugin]
-we-wallpaper toggle            # renderer off/on, keeps the watcher alive
+we-wallpaper backend [native|kde-plugin|owe]
+we-wallpaper owe <status|list|apply|pause|scan|prop|start|stop>
+we-wallpaper toggle            # renderer off/on (owe: pause toggle), keeps the watcher alive
 we-wallpaper next              # advance the slideshow now
 we-wallpaper thaw              # emergency: wake a frozen renderer
 we-wallpaper profile <name>    # apply a saved profile
@@ -176,7 +225,7 @@ System Settings → Shortcuts → KWin):
   "spans": [],                 // [{outputs:[...], id, scaling, clamp, properties}]
   "layer": "bottom",           // background|bottom|top|overlay
   "renderer": "",              // path to linux-wallpaperengine; empty = default, WE_RENDERER wins
-  "backend": "native",         // native | kde-plugin
+  "backend": "native",         // native | kde-plugin | owe
   "per_output": false,         // one renderer process per monitor -> pausing per monitor
   "span_pause_any": false,     // a span pauses when ONE of its monitors is covered (default: all)
   "fps": 30, "volume": 15, "silent": false, "noautomute": true,
@@ -249,11 +298,14 @@ effect back if an effect profile with *AutoStart* is saved in the plugin.
 
 - **COPR / distribution packages.** The spec builds locally; publishing to a
   COPR is the next step.
-- **Scene wallpapers with desktop icons.** The KDE plugin's scene backend is
-  not stable for every scene; the own renderer handles scenes but hides the
-  icons. Both facts come from the compositor: Plasma's desktop window is
-  composited opaque, so nothing below it can show through — a wallpaper has
-  to be drawn *inside* Plasma's wallpaper layer to sit under the icons.
+- **Scene wallpapers with desktop icons** are solved by the `owe` backend
+  (waywallen draws inside Plasma's wallpaper layer). The own renderer still
+  hides the icons: Plasma's desktop window is composited opaque, so nothing
+  below it can show through — that is a compositor fact, not a bug here.
+- **`owe` backend gaps:** spans (one wallpaper across several monitors) are not
+  mapped yet, displays are matched to your monitors by resolution because
+  waywallen does not expose connector names, and waywallen's own playlists are
+  not surfaced in the GUI.
 - More translations than German/English.
 
 ## License
