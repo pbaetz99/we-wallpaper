@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Friert den Wallpaper-Renderer ein, solange ein Fenster im Vollbild laeuft.
+
+KWin liefert das dafuer noetige Wayland-Protokoll (wlr-foreign-toplevel-management)
+nicht, deshalb uebernimmt ein KWin-Skript die Erkennung und meldet Wechsel per D-Bus.
+
+Sicherheitsnetze gegen einen dauerhaft eingefrorenen Renderer:
+  * beim Start wird ein evtl. eingefrorener Renderer sofort aufgeweckt
+  * der D-Bus-Name wird uebernommen statt aufzugeben (kein Wettlauf zweier Watcher)
+  * andere Watcher-Prozesse werden vorher ueber /proc beendet
+  * ein Wachhund prueft zyklisch, ob der Zustand noch plausibel ist
+  * beim Beenden (auch per SIGTERM) wird immer aufgeweckt
+"""
+import atexit
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+import json
+
+from PySide6.QtCore import ClassInfo, QCoreApplication, QObject, QTimer, Slot
+from PySide6.QtDBus import QDBusConnection, QDBusConnectionInterface, QDBusInterface
+
+HOME = Path.home()
+STATE = HOME / ".local/state"
+PIDFILE = STATE / "we-wallpaper.pid"
+SELFPID = STATE / "we-wallpaper-watch.pid"
+SCRIPT = HOME / ".local/share/we-wallpaper/fullscreen-watch.js"
+SCRIPT_NAME = "we-wallpaper-fullscreen-watch"
+SERVICE = "org.wewallpaper.Watch"
+WATCHDOG_MS = 5000
+CONF = HOME / ".config/we-wallpaper.json"
+PAUSEFILE = STATE / "we-wallpaper-pause.json"
+
+
+def conf_flag(key, default=True):
+    """Schalter aus der Konfiguration, ohne die Steuerung zu importieren."""
+    try:
+        return bool(json.loads(CONF.read_text(encoding="utf-8")).get(key, default))
+    except Exception:
+        return default
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
+
+
+def renderer_pid():
+    """PID des laufenden Renderers oder None."""
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def proc_state(pid):
+    """Prozesszustand laut /proc ('T' = per Signal angehalten)."""
+    try:
+        data = (Path("/proc") / str(pid) / "stat").read_text()
+        return data[data.rindex(")") + 2]
+    except (OSError, ValueError):
+        return None
+
+
+def thaw(pid, why):
+    """Weckt einen angehaltenen Prozess auf. Idempotent."""
+    if pid is None or proc_state(pid) != "T":
+        return False
+    try:
+        os.kill(pid, signal.SIGCONT)
+        log(f"aufgeweckt ({why}): {pid}")
+        return True
+    except OSError as e:
+        log(f"SIGCONT fehlgeschlagen: {e}")
+        return False
+
+
+def kill_other_watchers():
+    """Beendet andere Instanzen ueber /proc, damit der D-Bus-Name frei wird."""
+    me, killed = os.getpid(), []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        # Exakter Vergleich des Basisnamens eines argv-Elements. Ein Substring-
+        # Test wuerde auch Shells treffen, die den Namen nur erwaehnen.
+        hit = comm.startswith("python") and any(
+            os.path.basename(part.decode("utf-8", "ignore")) == "we-wallpaper-watch"
+            for part in cmdline if part)
+        if hit:
+            try:
+                os.kill(int(entry.name), signal.SIGTERM)
+                killed.append(int(entry.name))
+            except OSError:
+                pass
+    if killed:
+        for _ in range(20):
+            time.sleep(0.1)
+            if not any((Path("/proc") / str(p)).exists() for p in killed):
+                break
+        log(f"andere Watcher beendet: {killed}")
+    return killed
+
+
+def kwin(method, *args):
+    iface = QDBusInterface("org.kde.KWin", "/Scripting",
+                           "org.kde.kwin.Scripting", QDBusConnection.sessionBus())
+    if not iface.isValid():
+        return None
+    return iface.call(method, *args)
+
+
+@ClassInfo({"D-Bus Interface": SERVICE})
+class Watch(QObject):
+    def __init__(self):
+        super().__init__()
+        self.fullscreen = False
+        self.locked = False
+        self.covered = False
+        self.frozen_pid = None
+        self.manual_pause = False   # per Tastenkuerzel eingefroren
+
+    def _write_pause(self, reason):
+        try:
+            STATE.mkdir(parents=True, exist_ok=True)
+            PAUSEFILE.write_text(json.dumps({"reason": reason}))
+        except OSError:
+            pass
+
+    def pause_reason(self):
+        """Erster zutreffender Grund oder None. Reihenfolge = Prioritaet."""
+        if self.manual_pause:
+            return "Handpause"
+        if self.fullscreen and conf_flag("pause_on_fullscreen"):
+            return "Vollbild"
+        if self.locked and conf_flag("pause_on_lock"):
+            return "Bildschirm gesperrt"
+        if self.covered and conf_flag("pause_on_maximized"):
+            return "Fenster maximiert"
+        return None
+
+    def apply(self):
+        """Bringt den Renderer in den Zustand, den die Gruende verlangen."""
+        pid = renderer_pid()
+        if pid is None:
+            self.frozen_pid = None
+            return
+        reason = self.pause_reason()
+        state = proc_state(pid)
+        if reason and state != "T":
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                self.frozen_pid = pid
+                self._write_pause(reason)
+                log(f"{reason} -> Renderer {pid} eingefroren")
+            except OSError as e:
+                log(f"SIGSTOP fehlgeschlagen: {e}")
+        elif not reason and state == "T":
+            if thaw(pid, "Grund entfallen"):
+                self.frozen_pid = None
+                self._write_pause(None)
+
+    @Slot(bool)
+    def setFullscreen(self, active):
+        self.fullscreen = bool(active)
+        self.apply()
+
+    @Slot(bool)
+    def setCovered(self, covered):
+        """Vom KWin-Skript: alle Monitore mit Wallpaper sind von maximierten
+        Fenstern verdeckt (bzw. wieder frei)."""
+        self.covered = bool(covered)
+        self.apply()
+
+    @Slot(bool)
+    def onLockChanged(self, active):
+        """org.freedesktop.ScreenSaver.ActiveChanged - Sperrbildschirm an/aus."""
+        self.locked = bool(active)
+        log(f"Sperrbildschirm {'aktiv' if self.locked else 'aufgehoben'}")
+        self.apply()
+
+    @Slot(str)
+    def probe(self, text):
+        """Diagnosehaken: das KWin-Skript kann hierueber Werte melden."""
+        log(f"KWin-Skript meldet: {text}")
+
+    @Slot()
+    def toggleWallpaper(self):
+        """Wallpaper ganz aus/an - macht auf Plasma die Desktop-Icons frei."""
+        log("Tastenkuerzel: Wallpaper umschalten")
+        # bewusst 'toggle' und nicht stop/start: 'stop' wuerde unter systemd
+        # auch diesen Watcher beenden
+        self._run("toggle")
+
+    @Slot()
+    def nextWallpaper(self):
+        log("Tastenkuerzel: naechstes Wallpaper")
+        self._run("next")
+
+    @Slot()
+    def togglePause(self):
+        """Friert den Renderer von Hand ein bzw. weckt ihn - unabhaengig
+        vom Vollbild-Zustand."""
+        pid = renderer_pid()
+        if pid is None:
+            log("Tastenkuerzel: Pause - kein Renderer")
+            return
+        self.manual_pause = not self.manual_pause
+        log(f"Tastenkuerzel: Handpause {'an' if self.manual_pause else 'aus'}")
+        self.apply()
+
+    def _run(self, action):
+        """we-wallpaper im Hintergrund aufrufen, ohne die Eventloop zu blockieren."""
+        import subprocess
+        try:
+            subprocess.Popen([str(HOME / ".local/bin/we-wallpaper"), action],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            log(f"{action} fehlgeschlagen: {e}")
+
+    def watchdog(self):
+        """Faengt Zustaende ab, die nicht mehr zusammenpassen."""
+        pid = renderer_pid()
+        if pid is None:
+            self.frozen_pid = None
+            return
+        if self.pause_reason() is None and proc_state(pid) == "T":
+            thaw(pid, "Wachhund: kein Grund mehr, Renderer stand aber")
+            self.frozen_pid = None
+            self._write_pause(None)
+        elif self.pause_reason() and proc_state(pid) != "T":
+            self.apply()          # z.B. nach einem Renderer-Neustart
+        if self.frozen_pid and self.frozen_pid != pid:
+            thaw(self.frozen_pid, "Wachhund: alter Renderer noch angehalten")
+            self.frozen_pid = pid if self.fullscreen else None
+
+    def shutdown(self):
+        self.manual_pause = False
+        for pid in {self.frozen_pid, renderer_pid()}:
+            thaw(pid, "Watcher beendet")
+        self.frozen_pid = None
+
+
+def main():
+    app = QCoreApplication(sys.argv)
+    bus = QDBusConnection.sessionBus()
+    if not bus.isConnected():
+        log("keine Session-Bus-Verbindung")
+        return 1
+    if not SCRIPT.is_file():
+        log(f"KWin-Skript fehlt: {SCRIPT}")
+        return 1
+
+    kill_other_watchers()
+    thaw(renderer_pid(), "Start: Altlast beseitigen")
+
+    obj = Watch()
+    ci = bus.interface()
+    reply = ci.registerService(
+        SERVICE,
+        QDBusConnectionInterface.ReplaceExistingService,
+        QDBusConnectionInterface.AllowReplacement)
+    # 0 = ServiceNotRegistered, 1 = ServiceRegistered, 2 = ServiceQueued.
+    # Bewusst gegen int verglichen: PySide6 liefert hier ein int, waehrend die
+    # Enum-Konstanten strikt vergleichen und jeden Erfolg als Fehler ausweisen.
+    code = int(reply.value()) if reply.isValid() else 0
+    if code == 0:
+        log(f"D-Bus-Name {SERVICE} nicht erhalten")
+        return 1
+    if not bus.registerObject("/Watch", obj, QDBusConnection.ExportAllSlots):
+        log("Objekt konnte nicht registriert werden")
+        return 1
+    log(f"Dienst {SERVICE} bereit")
+    ok = bus.connect("org.freedesktop.ScreenSaver", "/ScreenSaver",
+                     "org.freedesktop.ScreenSaver", "ActiveChanged",
+                     obj, "1onLockChanged(bool)")   # fuehrende '1' = SLOT()-Format
+    log("Sperr-Signal abonniert" if ok else "Sperr-Signal NICHT abonniert")
+    # Ist die Sitzung beim Start schon gesperrt?
+    try:
+        r = QDBusInterface("org.freedesktop.ScreenSaver", "/ScreenSaver",
+                           "org.freedesktop.ScreenSaver", bus).call("GetActive")
+        obj.locked = bool(r.arguments()[0]) if r.arguments() else False
+    except Exception:
+        pass
+
+    kwin("unloadScript", SCRIPT_NAME)
+    if kwin("loadScript", str(SCRIPT), SCRIPT_NAME) is None:
+        log("KWin nicht erreichbar - Vollbild-Erkennung inaktiv")
+        return 1
+    kwin("start")
+    log("KWin-Skript geladen")
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    SELFPID.write_text(str(os.getpid()))
+
+    dog = QTimer()
+    dog.timeout.connect(obj.watchdog)
+    dog.start(WATCHDOG_MS)
+
+    def cleanup():
+        obj.shutdown()
+        kwin("unloadScript", SCRIPT_NAME)
+        if SELFPID.is_file():
+            try:
+                if int(SELFPID.read_text().strip()) == os.getpid():
+                    SELFPID.unlink()
+            except (OSError, ValueError):
+                pass
+
+    atexit.register(cleanup)
+
+    def on_signal(*_):
+        log("Signal empfangen - beende")
+        app.quit()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    # Damit Python-Signalhandler auch waehrend der Qt-Eventloop laufen
+    nudge = QTimer()
+    nudge.timeout.connect(lambda: None)
+    nudge.start(500)
+
+    rc = app.exec()
+    cleanup()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,17 @@
+[Unit]
+Description=Wallpaper Engine Vollbild-Pause (KWin-Erkennung)
+PartOf=plasma-workspace.target
+After=we-wallpaper.service
+# Bewusst kein Requires=/Requisite= auf we-wallpaper.service: das propagiert
+# die Deaktivierung, und der Watcher wuerde beim Wallpaper-Toggle mitsterben -
+# danach fehlt der Empfaenger fuer das Einschalt-Tastenkuerzel. Der Watcher
+# vertraegt einen fehlenden Renderer von sich aus.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/we-wallpaper-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=plasma-workspace.target

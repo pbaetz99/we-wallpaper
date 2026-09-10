@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Wallpaper Engine
+GenericName=Animierte Hintergrundbilder
+Comment=Wallpaper-Engine-Hintergruende verwalten (linux-wallpaperengine)
+Exec=we-wallpaper-gui
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=Settings;DesktopSettings;Qt;KDE;
+Keywords=wallpaper;hintergrund;background;animated;
+StartupNotify=true

@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+"""Steuerung fuer linux-wallpaperengine.
+
+Befehle: start | stop | restart | status | list | rotate-daemon
+Konfiguration: ~/.config/we-wallpaper.json  (Quelle der Wahrheit, von der GUI geschrieben)
+"""
+import json
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+# Pfad zum Renderer; per WE_RENDERER ueberschreibbar (auch in den systemd-Units
+# via `systemctl --user set-environment WE_RENDERER=/pfad` setzbar).
+BIN = Path(os.environ.get("WE_RENDERER") or
+           HOME / ".local/src/linux-wallpaperengine/build/output/linux-wallpaperengine")
+WORKSHOP = HOME / ".local/share/Steam/steamapps/workshop/content/431960"
+CONF = HOME / ".config/we-wallpaper.json"
+LEGACY = HOME / ".config/we-wallpaper.conf"
+STATE = HOME / ".local/state"
+LOG = STATE / "we-wallpaper.log"
+PIDFILE = STATE / "we-wallpaper.pid"
+ROTPID = STATE / "we-wallpaper-rotate.pid"
+WATCHPID = STATE / "we-wallpaper-watch.pid"
+WATCHER = HOME / ".local/bin/we-wallpaper-watch"
+WATCHLOG = STATE / "we-wallpaper-watch.log"
+UNITDIR = HOME / ".config/systemd/user"
+UNIT_RENDER = "we-wallpaper.service"
+UNIT_WATCH = "we-wallpaper-watch.service"
+
+DEFAULTS = {
+    "screens": {},          # name -> {id, scaling, clamp, properties:{}}
+    "fps": 30,
+    "volume": 15,
+    "silent": False,
+    "noautomute": True,
+    "no_audio_processing": False,
+    "disable_particles": False,
+    "disable_mouse": False,
+    "disable_parallax": False,
+    "no_fullscreen_pause": False,
+    "pause_on_fullscreen": True,   # eigene Erkennung per KWin-Skript
+    "pause_on_lock": True,         # Sperrbildschirm: Renderer einfrieren
+    "pause_on_maximized": True,    # alle Monitore von maximierten Fenstern verdeckt
+    "rotation": {"enabled": False, "minutes": 30, "pool": [],
+                 "order": "random", "index": 0},
+    "layer": "background",  # wlr-layer-shell-Ebene: background|bottom|top|overlay
+                            # 'bottom' verdeckt auf Plasma die Desktop-Icons
+    "spans": [],           # [{outputs:[...], id, scaling, clamp, properties}]
+    "profiles": {},        # Name -> gespeicherter Satz aller Einstellungen
+}
+
+
+# ---------------------------------------------------------------- Konfiguration
+def migrate_legacy():
+    """Uebernimmt die alte Bash-Config einmalig."""
+    cfg = dict(DEFAULTS)
+    cfg["screens"] = {}
+    txt = LEGACY.read_text(encoding="utf-8", errors="replace")
+    block = re.search(r"SCREENS=\((.*?)\)", txt, re.S)
+    if block:
+        for line in block.group(1).splitlines():
+            line = line.split("#", 1)[0]
+            m = re.search(r'"\s*([^"=\s]+)=([^":\s]+)(?::([^"\s]+))?\s*"', line)
+            if m and m.group(2).isdigit():
+                cfg["screens"][m.group(1)] = {
+                    "id": m.group(2), "scaling": m.group(3) or "fill",
+                    "clamp": "clamp", "properties": {}}
+    m = re.search(r"^\s*FPS=(\d+)", txt, re.M)
+    if m:
+        cfg["fps"] = int(m.group(1))
+    return cfg
+
+
+def load_conf():
+    if CONF.is_file():
+        try:
+            cfg = dict(DEFAULTS)
+            cfg.update(json.loads(CONF.read_text(encoding="utf-8")))
+            rot = dict(DEFAULTS["rotation"])
+            rot.update(cfg.get("rotation") or {})
+            cfg["rotation"] = rot
+            return cfg
+        except Exception as e:
+            print(f"Config unlesbar ({e}) - benutze Standardwerte", file=sys.stderr)
+            return dict(DEFAULTS)
+    if LEGACY.is_file():
+        cfg = migrate_legacy()
+        save_conf(cfg)
+        print(f"Alte Config uebernommen -> {CONF}", file=sys.stderr)
+        return cfg
+    return dict(DEFAULTS)
+
+
+def save_conf(cfg):
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- Hilfsfunktionen
+def enabled_outputs():
+    """Namen der eingeschalteten Monitore; leer wenn nicht ermittelbar."""
+    try:
+        out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
+                             text=True, timeout=5).stdout
+        return {o["name"] for o in json.loads(out).get("outputs", [])
+                if o.get("enabled") and o.get("name")}
+    except Exception:
+        return set()
+
+
+def title_of(wid):
+    try:
+        d = json.loads((WORKSHOP / wid / "project.json").read_text(
+            encoding="utf-8", errors="replace"))
+        return d.get("title") or wid
+    except Exception:
+        return wid
+
+
+def stray_pids():
+    """Alle laufenden Renderer-Prozesse - ermittelt ueber /proc/<pid>/exe,
+    also ohne Musterraten wie bei pkill. Faengt auch Prozesse ein, die von
+    einer aelteren Version oder einem abgebrochenen Lauf uebrig sind."""
+    try:
+        target = BIN.resolve()
+    except OSError:
+        return []
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "exe")).resolve() == target:
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def proc_state(pid):
+    """Prozesszustand laut /proc ('T' = per Signal angehalten)."""
+    try:
+        data = (Path("/proc") / str(pid) / "stat").read_text()
+        return data[data.rindex(")") + 2]
+    except (OSError, ValueError):
+        return None
+
+
+def rescue_frozen():
+    """Weckt einen eingefrorenen Renderer auf, wenn kein Watcher mehr lebt.
+    Faengt den Fall ab, dass der Watcher hart abgeschossen wurde."""
+    pid = read_pid(PIDFILE)
+    if pid is None or proc_state(pid) != "T":
+        return False
+    if read_pid(WATCHPID):
+        return False        # Watcher lebt, der regelt das selbst
+    try:
+        os.kill(pid, signal.SIGCONT)
+        print(f"  Renderer {pid} war eingefroren und wurde befreit "
+              f"(kein Watcher aktiv)")
+        return True
+    except OSError:
+        return False
+
+
+def read_pid(path):
+    try:
+        pid = int(path.read_text().strip())
+    except Exception:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def _bg_block(target_flag, target_value, sc):
+    """Ein --screen-root/--screen-span-Block samt Skalierung und Properties."""
+    block = [target_flag, target_value, "--bg", str(sc.get("id")),
+             "--scaling", sc.get("scaling") or "fill"]
+    if sc.get("clamp"):
+        block += ["--clamp", sc["clamp"]]
+    for pname, pval in (sc.get("properties") or {}).items():
+        block += ["--set-property", f"{pname}={pval}"]
+    return block
+
+
+def build_args(cfg):
+    """Baut die Kommandozeile. Gibt (args, skipped) zurueck."""
+    avail = enabled_outputs()
+    args, skipped = [], []
+    spanned = set()
+
+    # Zuerst Wallpaper, die ueber mehrere Monitore gespannt werden.
+    for span in cfg.get("spans") or []:
+        outs = [o for o in (span.get("outputs") or []) if o]
+        wid = str(span.get("id") or "")
+        if len(outs) < 2:
+            skipped.append(f"Span {outs}: mindestens zwei Monitore noetig")
+            continue
+        if not wid.isdigit() or not (WORKSHOP / wid).is_dir():
+            skipped.append(f"Span {','.join(outs)}: Wallpaper {wid!r} unbrauchbar")
+            continue
+        if avail and not all(o in avail for o in outs):
+            aus = [o for o in outs if o not in avail]
+            skipped.append(f"Span {','.join(outs)}: {', '.join(aus)} ausgeschaltet")
+            continue
+        args += _bg_block("--screen-span", ",".join(outs), span)
+        spanned.update(outs)
+
+    for name, sc in sorted(cfg.get("screens", {}).items()):
+        if name in spanned:
+            skipped.append(f"{name}: durch einen Span belegt")
+            continue
+        wid = str(sc.get("id") or "")
+        if not wid.isdigit():
+            skipped.append(f"{name}: ungueltige ID {wid!r}")
+            continue
+        if not (WORKSHOP / wid).is_dir():
+            skipped.append(f"{name}: Wallpaper {wid} nicht abonniert")
+            continue
+        if avail and name not in avail:
+            skipped.append(f"{name}: Monitor ausgeschaltet")
+            continue
+        args += _bg_block("--screen-root", name, sc)
+    if not args:
+        return [], skipped
+
+    layer = cfg.get("layer") or "background"
+    if layer in ("background", "bottom", "top", "overlay"):
+        args += ["--layer", layer]
+    args += ["--fps", str(cfg.get("fps", 30))]
+    if cfg.get("silent"):
+        args.append("--silent")
+    else:
+        args += ["--volume", str(cfg.get("volume", 15))]
+    for key, flag in (("noautomute", "--noautomute"),
+                      ("no_audio_processing", "--no-audio-processing"),
+                      ("disable_particles", "--disable-particles"),
+                      ("disable_mouse", "--disable-mouse"),
+                      ("disable_parallax", "--disable-parallax"),
+                      ("no_fullscreen_pause", "--no-fullscreen-pause")):
+        if cfg.get(key):
+            args.append(flag)
+    return args, skipped
+
+
+# ---------------------------------------------------------------- systemd
+RENDER_UNIT_TEXT = """[Unit]
+Description=Wallpaper Engine Renderer (linux-wallpaperengine)
+Documentation=https://github.com/Almamu/linux-wallpaperengine
+PartOf=plasma-workspace.target
+# After=plasma-core.target, NICHT plasma-workspace.target: zusammen mit
+# WantedBy=plasma-workspace.target ergaebe das einen Ordering-Zyklus, und
+# systemd loescht dann den Start-Job ("Job ... deleted to break ordering cycle").
+# plasma-core.target garantiert, dass KWin fuer Layer-Shell und Skripte steht.
+After=plasma-core.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/we-wallpaper run-renderer
+Restart=on-failure
+RestartSec=5
+# Beim Stoppen zuverlaessig auch eingefrorene Prozesse einsammeln
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=plasma-workspace.target
+"""
+
+WATCH_UNIT_TEXT = """[Unit]
+Description=Wallpaper Engine Vollbild-Pause (KWin-Erkennung)
+PartOf=plasma-workspace.target
+After=we-wallpaper.service
+# Bewusst kein Requires=/Requisite= auf we-wallpaper.service: das propagiert
+# die Deaktivierung, und der Watcher wuerde beim Wallpaper-Toggle mitsterben -
+# danach fehlt der Empfaenger fuer das Einschalt-Tastenkuerzel. Der Watcher
+# vertraegt einen fehlenden Renderer von sich aus.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/we-wallpaper-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=plasma-workspace.target
+"""
+
+
+def systemctl(*args, check=False):
+    try:
+        return subprocess.run(["systemctl", "--user", *args],
+                              capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+
+
+def service_installed():
+    return (UNITDIR / UNIT_RENDER).is_file()
+
+
+def service_enabled():
+    r = systemctl("is-enabled", UNIT_RENDER)
+    return bool(r and r.stdout.strip() == "enabled")
+
+
+def do_install_service():
+    UNITDIR.mkdir(parents=True, exist_ok=True)
+    (UNITDIR / UNIT_RENDER).write_text(RENDER_UNIT_TEXT, encoding="utf-8")
+    (UNITDIR / UNIT_WATCH).write_text(WATCH_UNIT_TEXT, encoding="utf-8")
+    systemctl("daemon-reload")
+    # Der Autostart-Eintrag wuerde sonst doppelt starten
+    auto = HOME / ".config/autostart/we-wallpaper.desktop"
+    if auto.is_file():
+        auto.unlink()
+        print("  Autostart-Eintrag entfernt (systemd uebernimmt)")
+    r = systemctl("enable", "--now", UNIT_RENDER, UNIT_WATCH)
+    if r and r.returncode != 0:
+        print(r.stderr.strip(), file=sys.stderr)
+        return 1
+    print(f"Dienste installiert und aktiviert: {UNIT_RENDER}, {UNIT_WATCH}")
+    return 0
+
+
+def do_uninstall_service():
+    systemctl("disable", "--now", UNIT_RENDER, UNIT_WATCH)
+    for u in (UNIT_RENDER, UNIT_WATCH):
+        f = UNITDIR / u
+        if f.is_file():
+            f.unlink()
+    systemctl("daemon-reload")
+    print("Dienste entfernt")
+    return 0
+
+
+def do_run_renderer():
+    """Vordergrundmodus fuer systemd: ersetzt den eigenen Prozess durch den
+    Renderer, damit systemd ihn direkt ueberwacht und neu starten kann."""
+    cfg = load_conf()
+    args, skipped = build_args(cfg)
+    for item in skipped:
+        print(f"uebersprungen: {item}", file=sys.stderr)
+    if not args:
+        print("kein nutzbarer Monitor konfiguriert", file=sys.stderr)
+        return 1
+    STATE.mkdir(parents=True, exist_ok=True)
+    PIDFILE.write_text(str(os.getpid()))   # execv behaelt die PID
+    os.execv(str(BIN), [str(BIN)] + args)
+
+
+# ---------------------------------------------------------------- Aktionen
+def kill_pidfile(path):
+    pid = read_pid(path)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGCONT)   # falls per SIGSTOP eingefroren
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    path.unlink(missing_ok=True)
+    return bool(pid)
+
+
+def do_stop(quiet=False):
+    if service_enabled():
+        systemctl("stop", UNIT_WATCH, UNIT_RENDER)
+        rescue_frozen()
+        # systemd raeumt nur, was in seinen Units haengt - aus fruehreren
+        # Laeufen uebrige Renderer muessen trotzdem weg
+        strays = stray_pids()
+        for pid in strays:
+            try:
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if strays:
+            time.sleep(0.5)
+            for pid in stray_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        PIDFILE.unlink(missing_ok=True)
+        if not quiet:
+            extra = f", {len(strays)} verwaiste(r) Renderer beendet" if strays else ""
+            print(f"gestoppt (systemd){extra}")
+        return True
+    kill_pidfile(WATCHPID)          # zuerst: entsperrt den Renderer beim Beenden
+    rot = kill_pidfile(ROTPID)
+    was = kill_pidfile(PIDFILE)
+    strays = stray_pids()
+    for pid in strays:
+        try:
+            os.kill(pid, signal.SIGCONT)
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+    if strays:
+        time.sleep(0.5)
+        for pid in stray_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if not quiet:
+            print(f"zusaetzlich {len(strays)} verwaiste(n) Renderer beendet")
+    if not quiet:
+        print("gestoppt" if (was or rot or strays) else "lief nicht")
+    return was or bool(strays)
+
+
+def spawn(cfg):
+    args, skipped = build_args(cfg)
+    for s in skipped:
+        print(f"uebersprungen: {s}", file=sys.stderr)
+    if not args:
+        print("kein nutzbarer Monitor konfiguriert - nichts gestartet")
+        return False
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "w") as log:
+        p = subprocess.Popen([str(BIN)] + args, stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    PIDFILE.write_text(str(p.pid))
+    return True
+
+
+def do_start():
+    cfg = load_conf()
+    if service_enabled():
+        systemctl("restart", UNIT_RENDER)
+        systemctl("restart", UNIT_WATCH) if cfg.get("pause_on_fullscreen") \
+            else systemctl("stop", UNIT_WATCH)
+        time.sleep(5)
+        return do_status()
+    do_stop(quiet=True)
+    if not spawn(cfg):
+        return 1
+    time.sleep(5)
+    if cfg.get("pause_on_fullscreen") and WATCHER.is_file():
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(WATCHLOG, "w") as wl:
+            wp = subprocess.Popen([sys.executable, str(WATCHER)], stdout=wl,
+                                  stderr=wl, stdin=subprocess.DEVNULL,
+                                  start_new_session=True)
+        WATCHPID.write_text(str(wp.pid))
+    rot = cfg.get("rotation") or {}
+    if rot.get("enabled") and len(rot.get("pool") or []) > 1:
+        r = subprocess.Popen([sys.executable, __file__, "rotate-daemon"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        ROTPID.write_text(str(r.pid))
+    do_status()
+    return 0
+
+
+def do_rotate_daemon():
+    """Wechselt in festem Takt die Wallpaper aus dem Pool."""
+    while True:
+        cfg = load_conf()
+        rot = cfg.get("rotation") or {}
+        pool = [w for w in (rot.get("pool") or []) if (WORKSHOP / str(w)).is_dir()]
+        if not rot.get("enabled") or len(pool) < 2:
+            return
+        time.sleep(max(1, int(rot.get("minutes", 30))) * 60)
+        cfg = load_conf()
+        rot = cfg.get("rotation") or {}
+        if not rot.get("enabled"):
+            return
+        if not advance_rotation(cfg):
+            return
+        if service_enabled():
+            systemctl("restart", UNIT_RENDER)
+        else:
+            kill_pidfile(PIDFILE)
+            spawn(load_conf())
+
+
+# Schluessel, die ein Profil umfasst (alles ausser den Profilen selbst)
+PROFILE_KEYS = [k for k in DEFAULTS if k != "profiles"]
+
+
+def do_profiles():
+    cfg = load_conf()
+    profs = cfg.get("profiles") or {}
+    if not profs:
+        print("keine Profile gespeichert")
+        return 0
+    for name in sorted(profs):
+        p = profs[name]
+        screens = p.get("screens") or {}
+        parts = [f"{n}={(sc or {}).get('id')}" for n, sc in sorted(screens.items())]
+        print(f"  {name}: fps={p.get('fps')}  {', '.join(parts) or 'keine Monitore'}")
+    return 0
+
+
+def do_profile(name):
+    cfg = load_conf()
+    profs = cfg.get("profiles") or {}
+    if name not in profs:
+        print(f"Profil {name!r} gibt es nicht. Vorhanden: "
+              f"{', '.join(sorted(profs)) or '(keine)'}", file=sys.stderr)
+        return 1
+    saved = profs[name]
+    for key in PROFILE_KEYS:
+        if key in saved:
+            cfg[key] = saved[key]
+    save_conf(cfg)
+    print(f"Profil {name!r} aktiviert")
+    return do_start()
+
+
+def unit_active(unit):
+    r = systemctl("is-active", unit)
+    return bool(r and r.stdout.strip() == "active")
+
+
+def watch_active():
+    """Laeuft die Vollbild-Erkennung - egal ob per PID-Datei oder als Dienst?"""
+    if read_pid(WATCHPID):
+        return True
+    return service_enabled() and unit_active(UNIT_WATCH)
+
+
+def advance_rotation(cfg):
+    """Setzt auf jedem Monitor das naechste Wallpaper aus dem Pool.
+
+    Reihenfolge "random" meidet das aktuelle Bild, "sequential" laeuft den Pool
+    stur durch. Properties werden verworfen, weil sie nur zu ihrem eigenen
+    Wallpaper passen.
+    """
+    rot = cfg.setdefault("rotation", {})
+    pool = [str(w) for w in (rot.get("pool") or [])
+            if (WORKSHOP / str(w)).is_dir()]
+    if len(pool) < 2:
+        return False
+    order = rot.get("order") or "random"
+    idx = int(rot.get("index") or 0)
+    targets = list(cfg.get("screens", {}).items())
+    for span in cfg.get("spans") or []:
+        targets.append((None, span))
+    if not targets:
+        return False
+    for _name, sc in targets:
+        if order == "sequential":
+            idx = (idx + 1) % len(pool)
+            sc["id"] = pool[idx]
+        else:
+            choices = [w for w in pool if w != str(sc.get("id"))] or pool
+            sc["id"] = random.choice(choices)
+        sc["properties"] = {}
+    rot["index"] = idx
+    save_conf(cfg)
+    return True
+
+
+def do_toggle():
+    """Nur den Renderer aus/an - laesst den Watcher ausdruecklich in Ruhe.
+
+    Wichtig: der Watcher ruft diese Aktion selbst auf. Wuerde sie (wie 'stop')
+    auch die Watcher-Unit stoppen, brachte sich der Aufrufer mitten in der
+    Aktion selbst um und liesse verwaiste Renderer zurueck.
+    """
+    running = read_pid(PIDFILE) is not None or bool(stray_pids())
+    if running:
+        if service_enabled():
+            systemctl("stop", UNIT_RENDER)
+        kill_pidfile(PIDFILE)
+        for pid in stray_pids():
+            try:
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(0.5)
+        for pid in stray_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        print("Wallpaper aus")
+        return 0
+    if service_enabled():
+        systemctl("start", UNIT_RENDER)
+        time.sleep(4)
+    else:
+        spawn(load_conf())
+        time.sleep(4)
+    print("Wallpaper an")
+    return 0
+
+
+def do_next():
+    cfg = load_conf()
+    if not advance_rotation(cfg):
+        print("Diashow-Pool braucht mindestens zwei Wallpaper", file=sys.stderr)
+        return 1
+    if service_enabled():
+        systemctl("restart", UNIT_RENDER)
+        time.sleep(4)
+    else:
+        kill_pidfile(PIDFILE)
+        spawn(load_conf())
+        time.sleep(4)
+    return do_status()
+
+
+def do_status():
+    cfg = load_conf()
+    rescue_frozen()
+    pid = read_pid(PIDFILE)
+    avail = enabled_outputs()
+    strays = [s for s in stray_pids() if s != pid]
+    if pid:
+        rot = cfg.get("rotation") or {}
+        extra = ""
+        if read_pid(ROTPID):
+            extra = f", Diashow alle {rot.get('minutes', 30)} min"
+        if watch_active():
+            extra += ", Vollbild-Pause aktiv"
+        if service_enabled():
+            extra += ", als systemd-Dienst"
+        frozen = ""
+        if proc_state(pid) == "T":
+            reason = "?"
+            try:
+                reason = json.loads((STATE / "we-wallpaper-pause.json").read_text()).get("reason") or "?"
+            except Exception:
+                pass
+            frozen = f"  [eingefroren: {reason}]"
+        print(f"running (pid {pid}), fps={cfg.get('fps', 30)}{extra}{frozen}")
+    else:
+        print(f"not running — siehe {LOG}")
+    if strays:
+        print(f"  WARNUNG: {len(strays)} verwaiste(r) Renderer laeuft mit "
+              f"(PID {', '.join(map(str, strays))}) - 'we-wallpaper stop' raeumt auf")
+    for name, sc in sorted(cfg.get("screens", {}).items()):
+        wid = str(sc.get("id") or "")
+        mark = "" if (not avail or name in avail) else "  (Monitor aus)"
+        props = sc.get("properties") or {}
+        pn = f"  [{len(props)} Property-Aenderungen]" if props else ""
+        print(f"  {name}: {wid}  [{sc.get('scaling', 'fill')}]{mark}  "
+              f"{title_of(wid)}{pn}")
+    return 0
+
+
+def do_list():
+    if not WORKSHOP.is_dir():
+        print(f"Workshop-Ordner fehlt: {WORKSHOP}", file=sys.stderr)
+        return 1
+    for d in sorted(WORKSHOP.iterdir()):
+        pj = d / "project.json"
+        if not pj.is_file():
+            continue
+        try:
+            j = json.loads(pj.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            j = {}
+        print(f"  {d.name:<12} [{(j.get('type') or '?'):<6}] {j.get('title') or d.name}")
+    return 0
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action == "start":
+        return do_start()
+    if action == "restart":
+        return do_start()
+    if action == "stop":
+        do_stop()
+        return 0
+    if action == "status":
+        return do_status()
+    if action == "list":
+        return do_list()
+    if action == "rotate-daemon":
+        return do_rotate_daemon()
+    if action == "run-renderer":
+        return do_run_renderer()
+    if action == "install-service":
+        return do_install_service()
+    if action == "uninstall-service":
+        return do_uninstall_service()
+    if action == "profiles":
+        return do_profiles()
+    if action == "profile":
+        if len(sys.argv) < 3:
+            print("Aufruf: we-wallpaper profile <Name>", file=sys.stderr)
+            return 1
+        return do_profile(sys.argv[2])
+    if action == "toggle":
+        return do_toggle()
+    if action == "next":
+        return do_next()
+    if action == "thaw":
+        pid = read_pid(PIDFILE)
+        if pid and proc_state(pid) == "T":
+            os.kill(pid, signal.SIGCONT)
+            print(f"Renderer {pid} aufgeweckt")
+        else:
+            print("nichts eingefroren")
+        return 0
+    print("Aufruf: we-wallpaper start|stop|restart|status|list|thaw|profile|profiles"
+          "|next|toggle|install-service|uninstall-service",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

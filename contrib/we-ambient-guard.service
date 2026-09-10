@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenRGB Ambient-Waechter (faengt den Plugin-Deadlock beim Display-Aus ab)
+PartOf=plasma-workspace.target
+After=plasma-core.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/we-ambient-guard
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=plasma-workspace.target

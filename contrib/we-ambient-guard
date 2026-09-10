@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Faengt den OpenRGB-Plugin-Deadlock ab, der beim Abschalten des Displays auftritt.
+
+Beobachtet: schaltet das OS den Bildschirm ab (bei dieser Einrichtung nach 15 min,
+mit vorheriger Sperre), laufen OpenRGBEffectsPlugin und OpenRGBVisualMapPlugin in
+einen Qt-Deadlock ("Dead lock detected in BlockingQueuedConnection"). Der
+Effekt-Thread ist danach tot, das Ambient-Licht bleibt aus - bis OpenRGB neu
+startet. Dieser Waechter erkennt die Meldung im Journal und startet OpenRGB neu.
+
+WICHTIG: Ein Neustart bringt das Ambient-Licht nur zurueck, wenn im Effects-Plugin
+ein Effekt-Profil mit gesetztem AutoStart gespeichert ist. Ist
+~/.config/OpenRGB/plugins/settings/effect-profiles/ leer, kommt OpenRGB zwar hoch,
+aber ohne Effekt.
+"""
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROFILES = HOME / ".config/OpenRGB/plugins/settings/effect-profiles"
+OPENRGB = Path("/usr/bin/openrgb")
+# Name der Unit, die systemd aus ~/.config/autostart/OpenRGB.desktop erzeugt;
+# bei anderem Dateinamen per WE_OPENRGB_UNIT ueberschreiben.
+UNIT = os.environ.get("WE_OPENRGB_UNIT", "app-OpenRGB@autostart.service")
+PATTERN = re.compile(r"Dead lock detected in BlockingQueuedConnection.*"
+                     r"(OpenRGBEffectsPlugin|OpenRGBVisualMapPlugin)")
+COOLDOWN = 120          # Sekunden zwischen zwei Neustarts
+SETTLE = 3              # kurz warten, damit beide Meldungen zusammen ankommen
+MIN_UPTIME = 90         # juengere Instanzen nicht neu starten (Schleifenschutz)
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
+
+
+def openrgb_pids():
+    """PIDs ueber /proc/<pid>/exe - kein Musterraten wie bei pkill."""
+    try:
+        target = OPENRGB.resolve()
+    except OSError:
+        return []
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "exe")).resolve() == target:
+                found.append(int(entry.name))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def openrgb_uptime():
+    """Laufzeit der aeltesten OpenRGB-Instanz in Sekunden (0 = keine)."""
+    import time as _t
+    best = 0.0
+    for pid in openrgb_pids():
+        try:
+            start = os.path.getmtime(f"/proc/{pid}")
+            best = max(best, _t.time() - start)
+        except OSError:
+            continue
+    return best
+
+
+def cgroup_of(pid):
+    try:
+        return open(f"/proc/{pid}/cgroup").read().strip().rsplit("/", 1)[-1]
+    except OSError:
+        return ""
+
+
+def dedup_openrgb():
+    """Beendet doppelte OpenRGB-Instanzen.
+
+    Plasmas Sitzungswiederherstellung startet OpenRGB auf dem Wayland-Pfad
+    zusaetzlich zum Autostart-Eintrag als transiente Unit
+    app-org.openrgb.OpenRGB@<uuid>.service; 'excludeApps' greift dort nicht.
+    Kanonisch ist die Autostart-Unit - alles andere wird beendet.
+    """
+    pids = openrgb_pids()
+    if len(pids) < 2:
+        return 0
+    canon = [p for p in pids if cgroup_of(p) == UNIT]
+    keep = canon[0] if canon else min(pids)
+    victims = [p for p in pids if p != keep]
+    for p in victims:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(3)
+    for p in victims:
+        if p in openrgb_pids():
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    log(f"Doppelstart bereinigt: behalte PID {keep} ({cgroup_of(keep) or '?'}), "
+        f"beendet {victims}")
+    return len(victims)
+
+
+def restart_openrgb():
+    """Neustart ueber die systemd-Unit statt per Hand.
+
+    Selbst gebautes SIGTERM/SIGKILL hat gegen den deadlockten Prozess zwei
+    Stunden gebraucht und OpenRGB anschliessend ausserhalb seiner Unit
+    hochgezogen. systemd kennt den richtigen cgroup, hat ein hartes
+    Stop-Timeout und faellt selbst auf SIGKILL zurueck.
+    """
+    before = len(openrgb_pids())
+    r = subprocess.run(["systemctl", "--user", "reset-failed", UNIT],
+                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run(["systemctl", "--user", "restart", UNIT],
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        log(f"systemctl restart {UNIT} fehlgeschlagen: {r.stderr.strip()[:120]}")
+        return
+    # kurz warten und nachsehen, ob wirklich genau eine Instanz laeuft
+    for _ in range(30):
+        time.sleep(1)
+        if openrgb_pids():
+            break
+    log(f"OpenRGB ueber {UNIT} neu gestartet "
+        f"(vorher {before}, jetzt {len(openrgb_pids())} Instanz(en))")
+    if not PROFILES.is_dir() or not any(PROFILES.iterdir()):
+        log("HINWEIS: kein Effekt-Profil mit AutoStart gespeichert - "
+            "Ambient kommt dadurch nicht von selbst zurueck")
+
+
+def main():
+    if "--selftest" in sys.argv:
+        proben = [
+            'QMetaMethod::invoke: Dead lock detected in BlockingQueuedConnection: '
+            'Receiver is OpenRGBEffectsPlugin',
+            'QMetaMethod::invoke: Dead lock detected in BlockingQueuedConnection: '
+            'Receiver is OpenRGBVisualMapPlugin',
+            'Registering RGB controller Govee',
+            'Dead lock detected in BlockingQueuedConnection: Receiver is Foo',
+        ]
+        for p in proben:
+            print(f"  {'TREFFER' if PATTERN.search(p) else 'ignoriert'}: {p[:78]}")
+        return 0
+
+    log("Waechter gestartet - beobachte das Journal auf den Plugin-Deadlock")
+    # Beim Login kurz warten, bis alle Startpfade durch sind, dann bereinigen.
+    import threading
+    def dedup_loop():
+        time.sleep(15)
+        dedup_openrgb()
+        while True:
+            time.sleep(60)
+            dedup_openrgb()
+    threading.Thread(target=dedup_loop, daemon=True).start()
+    proc = subprocess.Popen(
+        ["journalctl", "--user", "-f", "-n", "0", "-o", "cat", "_COMM=openrgb"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    last = 0.0
+    try:
+        for line in proc.stdout:
+            if not PATTERN.search(line):
+                continue
+            now = time.time()
+            if now - last < COOLDOWN:
+                continue
+            # OpenRGB gibt die Meldung auch beim eigenen Herunterfahren aus.
+            # Ohne diese Sperre startet der Waechter das gerade frisch
+            # gestartete OpenRGB sofort wieder neu - eine Schleife.
+            up = openrgb_uptime()
+            if up and up < MIN_UPTIME:
+                log(f"Deadlock-Meldung ignoriert - OpenRGB laeuft erst "
+                    f"{up:.0f}s (vermutlich Neustart-Rauschen)")
+                continue
+            last = now
+            log(f"Deadlock erkannt: {line.strip()[:90]}")
+            time.sleep(SETTLE)
+            restart_openrgb()
+    finally:
+        proc.terminate()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

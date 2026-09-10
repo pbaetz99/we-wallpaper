@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+"""Wallpaper Engine — vollstaendige Verwaltung fuer linux-wallpaperengine (KDE Plasma)."""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QByteArray, QProcess, QSize, Qt, QTimer
+from PySide6.QtGui import (QAction, QColor, QGuiApplication, QIcon, QImageReader,
+                           QMovie, QPixmap)
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout,
+    QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QSplitter, QStyle, QSystemTrayIcon, QTabWidget,
+    QTextEdit,
+    QVBoxLayout, QWidget)
+
+HOME = Path.home()
+WORKSHOP = HOME / ".local/share/Steam/steamapps/workshop/content/431960"
+CONF = HOME / ".config/we-wallpaper.json"
+UISTATE = HOME / ".local/state/we-wallpaper-ui.json"
+CTL = HOME / ".local/bin/we-wallpaper"
+AUTOSTART = HOME / ".config/autostart/we-wallpaper.desktop"
+WORKSHOP_URL = "https://steamcommunity.com/app/431960/workshop/"
+RENDERER = Path(os.environ.get("WE_RENDERER") or
+                HOME / ".local/src/linux-wallpaperengine/build/output/linux-wallpaperengine")
+CACHE = HOME / ".cache/we-wallpaper"
+PROFILE_PLACEHOLDER = "— Profil —"
+
+SCALINGS = ["fill", "fit", "stretch", "default"]
+CLAMPS = ["clamp", "border", "repeat"]
+THUMB = QSize(220, 124)
+
+# WE-Lokalisierungsschluessel, die in project.json auftauchen
+UI_KEYS = {
+    "ui_browse_properties_scheme_color": "Schemafarbe",
+    "ui_browse_properties_background_color": "Hintergrundfarbe",
+    "ui_editor_properties_color": "Farbe",
+    "ui_editor_properties_opacity": "Deckkraft",
+    "ui_editor_properties_speed": "Geschwindigkeit",
+    "ui_editor_properties_scale": "Groesse",
+    "ui_editor_properties_alignment": "Ausrichtung",
+    "ui_editor_properties_image": "Bild",
+    "ui_editor_properties_text": "Text",
+    "ui_editor_properties_volume": "Lautstaerke",
+}
+
+
+def nice_label(raw, key):
+    if not raw:
+        return key.replace("_", " ").strip().title()
+    if raw in UI_KEYS:
+        return UI_KEYS[raw]
+    if raw.startswith("ui_"):
+        return raw.split("_")[-1].replace("-", " ").title()
+    return raw
+
+
+# --------------------------------------------------------------- Erscheinungsbild
+ACCENT = "#7c5cff"
+QSS = """
+* { font-size: 10pt; }
+QWidget#Root { background: #16161c; color: #e6e6ee; }
+QLabel { color: #e6e6ee; }
+QLabel#H1 { font-size: 15pt; font-weight: 600; }
+QLabel#Section {
+    color: #9a9ab0; font-size: 8.5pt; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px; padding: 2px 0 2px 2px;
+}
+QLabel#Muted { color: #9a9ab0; }
+QFrame#Card {
+    background: #1e1e26; border: 1px solid #2b2b36; border-radius: 10px;
+}
+QFrame#Bar {
+    background: #1a1a22; border: 1px solid #2b2b36; border-radius: 10px;
+}
+QLabel#Pill {
+    background: #23232e; border: 1px solid #32323f; border-radius: 11px;
+    padding: 3px 12px; color: #cfcfe0;
+}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+    background: #14141a; border: 1px solid #32323f; border-radius: 7px;
+    padding: 5px 8px; color: #e6e6ee; selection-background-color: ACCENTCOLOR;
+}
+QComboBox { padding-right: 22px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid ACCENTCOLOR;
+}
+QComboBox::drop-down {
+    border: none; width: 20px; subcontrol-origin: padding;
+    subcontrol-position: center right;
+}
+/* Qt-Stylesheets koennen weder Bilddaten einbetten noch CSS-Dreiecke
+   zeichnen (das ergibt einen Klotz), daher ein zur Laufzeit erzeugtes PNG. */
+QComboBox::down-arrow {
+    image: url(ARROW_NORMAL); width: 11px; height: 7px; margin-right: 7px;
+}
+QComboBox::down-arrow:on { image: url(ARROW_ACCENT); }
+QComboBox QAbstractItemView {
+    background: #1e1e26; border: 1px solid #32323f;
+    selection-background-color: ACCENTCOLOR; outline: none;
+}
+QPushButton {
+    background: #26263140; border: 1px solid #3a3a48; border-radius: 7px;
+    padding: 6px 13px; color: #e6e6ee;
+}
+QPushButton:hover { background: #2e2e3c; border-color: #4a4a5c; }
+QPushButton:pressed { background: #202028; }
+QPushButton:disabled { color: #6b6b7e; border-color: #2b2b36; }
+QPushButton#Primary {
+    background: ACCENTCOLOR; border: 1px solid ACCENTCOLOR;
+    color: #ffffff; font-weight: 600;
+}
+QPushButton#Primary:hover { background: #8f73ff; border-color: #8f73ff; }
+QPushButton#Danger:hover { background: #52242c; border-color: #7d3a44; }
+QListWidget {
+    background: #14141a; border: 1px solid #2b2b36; border-radius: 10px;
+    outline: none; padding: 4px;
+}
+QListWidget::item {
+    color: #d8d8e6; border: 1px solid transparent; border-radius: 9px;
+    padding: 6px; margin: 3px;
+}
+QListWidget::item:hover { background: #20202a; border-color: #33333f; }
+QListWidget::item:selected {
+    background: #2a2340; border-color: ACCENTCOLOR; color: #ffffff;
+}
+QListWidget::item:disabled { color: #6b6b7e; }
+QTabWidget::pane {
+    border: 1px solid #2b2b36; border-radius: 9px; background: #1a1a22; top: -1px;
+}
+QTabBar::tab {
+    background: transparent; color: #9a9ab0; padding: 6px 14px;
+    border: 1px solid transparent; border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+}
+QTabBar::tab:selected {
+    color: #ffffff; background: #1a1a22;
+    border-color: #2b2b36; border-bottom-color: #1a1a22;
+}
+QTabBar::tab:hover:!selected { color: #d8d8e6; }
+QGroupBox {
+    border: 1px solid #2b2b36; border-radius: 9px; margin-top: 14px;
+    padding: 10px 8px 8px 8px; background: #1a1a22;
+}
+QGroupBox::title {
+    subcontrol-origin: margin; left: 10px; padding: 0 5px;
+    color: #9a9ab0; font-weight: 700; font-size: 8.5pt;
+}
+QCheckBox { color: #d8d8e6; spacing: 6px; }
+QCheckBox::indicator {
+    width: 15px; height: 15px; border-radius: 4px;
+    border: 1px solid #45455a; background: #14141a;
+}
+QCheckBox::indicator:hover { border-color: ACCENTCOLOR; }
+QCheckBox::indicator:checked { background: ACCENTCOLOR; border-color: ACCENTCOLOR; }
+QSlider::groove:horizontal {
+    height: 4px; background: #2b2b36; border-radius: 2px;
+}
+QSlider::sub-page:horizontal { background: ACCENTCOLOR; border-radius: 2px; }
+QSlider::handle:horizontal {
+    background: #e6e6ee; width: 13px; height: 13px;
+    margin: -5px 0; border-radius: 7px;
+}
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical {
+    background: #34344250; border-radius: 5px; min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: #45455a; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal {
+    background: #34344250; border-radius: 5px; min-width: 30px;
+}
+QSplitter::handle { background: transparent; width: 8px; }
+QMenu {
+    background: #1e1e26; border: 1px solid #32323f; border-radius: 8px; padding: 4px;
+}
+QMenu::item { padding: 6px 22px; border-radius: 6px; }
+QMenu::item:selected { background: ACCENTCOLOR; color: #ffffff; }
+QMenu::separator { height: 1px; background: #2b2b36; margin: 4px 8px; }
+QToolTip {
+    background: #1e1e26; color: #e6e6ee; border: 1px solid #3a3a48;
+    border-radius: 6px; padding: 5px;
+}
+""".replace("ACCENTCOLOR", ACCENT)
+
+
+# ------------------------------------------------------------------ Datenzugriff
+RESCACHE = CACHE / "resolutions.json"
+
+
+def _load_rescache():
+    try:
+        return json.loads(RESCACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def media_resolution(folder, project, cache):
+    """Echte Aufloesung des Wallpapers.
+
+    Nur bei Video-Wallpapern bestimmbar (per ffprobe). Scene- und Web-Wallpaper
+    geben ihre Groesse nicht bekannt; das Vorschaubild taugt nicht als Ersatz,
+    weil Steam es quadratisch zuschneidet. Ergebnis wird zwischengespeichert.
+    """
+    content = project.get("file") or ""
+    if (project.get("type") or "").lower() != "video" or not content:
+        return 0, 0
+    path = folder / content
+    if not path.is_file():
+        return 0, 0
+    key = f"{folder.name}:{int(path.stat().st_mtime)}"
+    if key in cache:
+        return tuple(cache[key])
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=20)
+        wh = [int(x) for x in r.stdout.strip().split(",")[:2]]
+        res = (wh[0], wh[1]) if len(wh) == 2 else (0, 0)
+    except Exception:
+        res = (0, 0)
+    cache[key] = list(res)
+    return res
+
+
+def load_wallpapers():
+    items = []
+    if not WORKSHOP.is_dir():
+        return items
+    cache = _load_rescache()
+    cache_before = len(cache)
+    for d in sorted(WORKSHOP.iterdir()):
+        pj = d / "project.json"
+        if not d.is_dir() or not pj.is_file():
+            continue
+        try:
+            j = json.loads(pj.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            j = {}
+        preview_name = j.get("preview", "preview.jpg")
+        content = j.get("file", "")
+        has_content = bool(content) and (d / content).exists()
+        if not has_content:
+            has_content = any(
+                p.name != preview_name and p.name != "project.json"
+                and p.suffix.lower() in (".pkg", ".mp4", ".webm", ".json", ".html", ".gif")
+                for p in d.iterdir())
+        prev = d / preview_name
+        size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+        rw, rh = media_resolution(d, j, cache)
+        items.append({
+            "id": d.name,
+            "title": j.get("title") or d.name,
+            "type": (j.get("type") or "?").lower(),
+            "tags": j.get("tags") or [],
+            "description": j.get("description") or "",
+            "url": j.get("workshopurl") or f"{WORKSHOP_URL}",
+            "preview": prev if prev.is_file() else None,
+            "props": ((j.get("general") or {}).get("properties") or {}),
+            "ok": has_content,
+            "size": size,
+            "mtime": d.stat().st_mtime,
+            "rw": rw, "rh": rh,
+            "aspect": (rw / rh) if rw and rh else 0.0,
+        })
+    if len(cache) != cache_before:
+        try:
+            CACHE.mkdir(parents=True, exist_ok=True)
+            RESCACHE.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+    return items
+
+
+def detect_monitors():
+    try:
+        out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
+                             text=True, timeout=5).stdout
+        res = []
+        for o in json.loads(out).get("outputs", []):
+            if not o.get("connected"):
+                continue
+            sz = o.get("size") or {}
+            res.append((o.get("name", "?"), sz.get("width", 0), sz.get("height", 0),
+                        bool(o.get("enabled"))))
+        if res:
+            return res
+    except Exception:
+        pass
+    return [(s.name(), s.geometry().width(), s.geometry().height(), True)
+            for s in QGuiApplication.screens()]
+
+
+DEFAULT_CONF = {
+    "screens": {}, "fps": 30, "volume": 15, "silent": False, "noautomute": True,
+    "no_audio_processing": False, "disable_particles": False, "disable_mouse": False,
+    "disable_parallax": False, "no_fullscreen_pause": False,
+    "pause_on_fullscreen": True, "pause_on_lock": True, "pause_on_maximized": True,
+    "rotation": {"enabled": False, "minutes": 30, "pool": [], "order": "random"},
+    "profiles": {}, "spans": [], "favorites": [], "hidden": [],
+}
+
+
+UI_DEFAULTS = {
+    "geometry": "", "thumb": 220, "sort": "Titel", "tag": "Alle", "typ": "Alle",
+    "search": "", "monitor_row": 0, "only_favs": False, "show_hidden": False,
+    "aspect_only": False, "tab": 0, "last_id": "",
+}
+
+
+def make_arrow(path, color):
+    """Zeichnet ein kleines Dreieck als PNG fuer die Auswahlfelder."""
+    from PySide6.QtGui import QPainter, QPainterPath, QPolygonF
+    from PySide6.QtCore import QPointF
+    pm = QPixmap(22, 14)
+    pm.fill(Qt.transparent)
+    pen = QPainter(pm)
+    pen.setRenderHint(QPainter.Antialiasing)
+    poly = QPolygonF([QPointF(3, 4), QPointF(19, 4), QPointF(11, 11)])
+    pp = QPainterPath()
+    pp.addPolygon(poly)
+    pen.fillPath(pp, QColor(color))
+    pen.end()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pm.save(str(path), "PNG")
+    return path
+
+
+def build_qss():
+    """Stylesheet mit den Pfaden der erzeugten Pfeilbilder."""
+    normal = make_arrow(CACHE / "arrow.png", "#9a9ab0")
+    accent = make_arrow(CACHE / "arrow_accent.png", ACCENT)
+    return (QSS.replace("ARROW_NORMAL", normal.as_posix())
+               .replace("ARROW_ACCENT", accent.as_posix()))
+
+
+def service_installed():
+    return (HOME / ".config/systemd/user/we-wallpaper.service").is_file()
+
+
+def load_ui():
+    st = dict(UI_DEFAULTS)
+    if UISTATE.is_file():
+        try:
+            st.update(json.loads(UISTATE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return st
+
+
+def save_ui(st):
+    UISTATE.parent.mkdir(parents=True, exist_ok=True)
+    UISTATE.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_conf():
+    cfg = json.loads(json.dumps(DEFAULT_CONF))
+    if CONF.is_file():
+        try:
+            cfg.update(json.loads(CONF.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    rot = dict(DEFAULT_CONF["rotation"])
+    rot.update(cfg.get("rotation") or {})
+    cfg["rotation"] = rot
+    return cfg
+
+
+def save_conf(cfg):
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ------------------------------------------------------------------ Bedingungen
+COND_RE = re.compile(r"(\w+)\.value\s*(>=|<=|==|!=|>|<)\s*([-\d.]+)")
+
+
+def cond_ok(condition, values):
+    """Wertet WE-Bedingungen wie 'numwaterfalls.value >= 1' aus (&&/|| unterstuetzt)."""
+    if not condition:
+        return True
+    def one(m):
+        name, op, num = m.group(1), m.group(2), float(m.group(3))
+        try:
+            cur = float(values.get(name, 0))
+        except (TypeError, ValueError):
+            return True
+        return {">=": cur >= num, "<=": cur <= num, ">": cur > num,
+                "<": cur < num, "==": cur == num, "!=": cur != num}[op]
+    try:
+        parts_or = re.split(r"\|\|", condition)
+        for grp in parts_or:
+            if all(one(m) for m in [COND_RE.search(p) for p in re.split(r"&&", grp)] if m):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def col_to_qcolor(txt):
+    try:
+        r, g, b = (float(x) for x in str(txt).split()[:3])
+        return QColor(int(r * 255), int(g * 255), int(b * 255))
+    except Exception:
+        return QColor(255, 255, 255)
+
+
+def qcolor_to_we(c):
+    return f"{c.red()/255:.5f} {c.green()/255:.5f} {c.blue()/255:.5f}"
+
+
+# ------------------------------------------------------------------ Properties-Editor
+class PropertyEditor(QScrollArea):
+    """Baut aus dem project.json-Schema dynamisch Bedienelemente."""
+
+    def __init__(self, on_change):
+        super().__init__()
+        self.on_change = on_change
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.body = QWidget()
+        self.form = QFormLayout(self.body)
+        self.form.setLabelAlignment(Qt.AlignLeft)
+        self.setWidget(self.body)
+        self.schema, self.values, self.rows, self.editable = {}, {}, {}, True
+
+    def clear(self):
+        while self.form.count():
+            it = self.form.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self.rows = {}
+
+    def build(self, schema, overrides, editable=True):
+        self.clear()
+        self.schema = schema or {}
+        self.editable = editable
+        self.values = {k: (overrides.get(k) if k in overrides else v.get("value"))
+                       for k, v in self.schema.items() if isinstance(v, dict)}
+        if not self.schema:
+            self.form.addRow(QLabel("Dieses Wallpaper bietet keine Einstellungen."))
+            return
+        ordered = sorted(
+            ((k, v) for k, v in self.schema.items() if isinstance(v, dict)),
+            key=lambda kv: (kv[1].get("order", 0), kv[0]))
+        for key, spec in ordered:
+            w = self.make_widget(key, spec)
+            if w is None:
+                continue
+            label = QLabel(nice_label(spec.get("text"), key))
+            label.setWordWrap(True)
+            self.form.addRow(label, w)
+            self.rows[key] = (label, w, spec)
+        self.apply_conditions()
+
+    def make_widget(self, key, spec):
+        t = spec.get("type") or ("slider" if "min" in spec and "max" in spec else "")
+        val = self.values.get(key)
+        if t == "group":
+            lbl = QLabel(f"<b>{nice_label(spec.get('text'), key)}</b>")
+            return lbl
+        if t == "bool":
+            w = QCheckBox()
+            w.setChecked(str(val).lower() in ("1", "true", "yes"))
+            w.toggled.connect(lambda c, k=key: self.changed(k, "1" if c else "0"))
+        elif t == "combo":
+            w = QComboBox()
+            for opt in spec.get("options") or []:
+                w.addItem(str(opt.get("label", opt.get("value"))), str(opt.get("value")))
+            i = w.findData(str(val))
+            if i >= 0:
+                w.setCurrentIndex(i)
+            w.currentIndexChanged.connect(
+                lambda _, k=key, ww=w: self.changed(k, ww.currentData()))
+        elif t == "color":
+            w = QPushButton()
+            w.setMinimumHeight(26)
+            self.paint_button(w, col_to_qcolor(val))
+            w.clicked.connect(lambda _, k=key, ww=w: self.pick_color(k, ww))
+        elif t == "slider":
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            frac = spec.get("fraction") or (isinstance(spec.get("step"), float))
+            lo, hi = float(spec.get("min", 0)), float(spec.get("max", 1))
+            sl = QSlider(Qt.Horizontal)
+            box = QDoubleSpinBox() if frac else QSpinBox()
+            steps = 1000 if frac else max(1, int(hi - lo))
+            sl.setRange(0, steps)
+            try:
+                cur = float(val)
+            except (TypeError, ValueError):
+                cur = lo
+            if frac:
+                box.setDecimals(min(4, int(spec.get("precision", 3) or 3)))
+                box.setRange(lo, hi)
+                box.setSingleStep(float(spec.get("step", 0.01) or 0.01))
+            else:
+                box.setRange(int(lo), int(hi))
+            box.setValue(cur)
+            box.setMaximumWidth(96)
+            sl.setValue(int((cur - lo) / (hi - lo) * steps) if hi > lo else 0)
+
+            def from_slider(v, lo=lo, hi=hi, steps=steps, box=box):
+                box.setValue(lo + (hi - lo) * v / steps)
+
+            def from_box(v, k=key, sl=sl, lo=lo, hi=hi, steps=steps):
+                sl.blockSignals(True)
+                sl.setValue(int((v - lo) / (hi - lo) * steps) if hi > lo else 0)
+                sl.blockSignals(False)
+                self.changed(k, f"{v:g}")
+            sl.valueChanged.connect(from_slider)
+            box.valueChanged.connect(from_box)
+            lay.addWidget(sl, 1)
+            lay.addWidget(box)
+        elif t in ("textinput", "text"):
+            w = QLineEdit(str(val or ""))
+            w.textEdited.connect(lambda s, k=key: self.changed(k, s))
+        elif t == "file":
+            w = QLabel(f"<i>{val or '—'}</i>  (Datei, nicht editierbar)")
+        else:
+            return None
+        w.setEnabled(self.editable or t == "group")
+        return w
+
+    @staticmethod
+    def paint_button(btn, color):
+        btn.setStyleSheet(
+            f"background-color: {color.name()}; border: 1px solid #666; border-radius: 3px;")
+        btn.setText(color.name())
+
+    def pick_color(self, key, btn):
+        c = QColorDialog.getColor(col_to_qcolor(self.values.get(key)), self,
+                                  "Farbe waehlen")
+        if c.isValid():
+            self.paint_button(btn, c)
+            self.changed(key, qcolor_to_we(c))
+
+    def changed(self, key, value):
+        self.values[key] = value
+        self.apply_conditions()
+        if self.editable:
+            self.on_change(key, value)
+
+    def apply_conditions(self):
+        for key, (label, widget, spec) in self.rows.items():
+            ok = cond_ok(spec.get("condition"), self.values)
+            label.setVisible(ok)
+            widget.setVisible(ok)
+
+
+# ------------------------------------------------------------------ Hauptfenster
+class Window(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Wallpaper Engine")
+        self.resize(1500, 900)
+        self.ui = load_ui()
+        self.wallpapers = load_wallpapers()
+        self.by_id = {w["id"]: w for w in self.wallpapers}
+        self.cfg = load_conf()
+        self.movie = None
+        self.thumb = QSize(int(self.ui["thumb"]),
+                           int(int(self.ui["thumb"]) * 9 / 16))
+
+        central = QWidget()
+        central.setObjectName("Root")
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.addWidget(self.build_toolbar())
+
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self.build_left())
+        split.addWidget(self.build_center())
+        split.addWidget(self.build_right())
+        split.setSizes([300, 700, 440])
+        split.setStretchFactor(1, 1)
+        outer.addWidget(split, 1)
+        outer.addWidget(self.build_bottom())
+
+        self.populate_grid()
+        self.fill_monitors()
+        self.mon_list.currentRowChanged.connect(self.on_monitor_selected)
+        if self.mon_list.count():
+            self.mon_list.setCurrentRow(0)
+        self.refresh_profiles()
+        self.build_tray()
+        self.render_proc = None
+        self.render_target = None
+        self.restore_ui()
+        self.refresh_status()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_status)
+        self.timer.start(5000)
+        self.ui_timer = QTimer(self)
+        self.ui_timer.timeout.connect(self.maybe_save_ui)
+        self.ui_timer.start(20000)
+
+    # ---------------- Aufbau
+    def build_toolbar(self):
+        bar = QFrame()
+        bar.setObjectName("Bar")
+        lay = QHBoxLayout(bar)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Suchen … (Titel, Beschreibung, ID)")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.apply_filter)
+        lay.addWidget(self.search, 2)
+
+        self.fav_only = QCheckBox("★ nur Favoriten")
+        self.fav_only.setChecked(bool(self.ui["only_favs"]))
+        self.fav_only.toggled.connect(self.apply_filter)
+        lay.addWidget(self.fav_only)
+        self.show_hidden = QCheckBox("versteckte zeigen")
+        self.show_hidden.setChecked(bool(self.ui["show_hidden"]))
+        self.show_hidden.toggled.connect(self.apply_filter)
+        lay.addWidget(self.show_hidden)
+        self.aspect_only = QCheckBox("native Auflösung")
+        self.aspect_only.setToolTip(
+            "Zeigt nur Wallpaper, deren echtes Seitenverhältnis zum gewählten\n"
+            "Monitor passt (±12 %). Messbar ist das nur bei Video-Wallpapern;\n"
+            "Scene- und Web-Wallpaper nennen ihre Auflösung nicht und werden\n"
+            "von diesem Filter ausgeblendet.")
+        self.aspect_only.setChecked(bool(self.ui["aspect_only"]))
+        self.aspect_only.toggled.connect(self.apply_filter)
+        lay.addWidget(self.aspect_only)
+
+        lay.addWidget(QLabel("Tag:"))
+        self.tag_box = QComboBox()
+        self.tag_box.addItem("Alle")
+        for t in sorted({t for w in self.wallpapers for t in w["tags"]}):
+            self.tag_box.addItem(t)
+        self.tag_box.currentTextChanged.connect(self.apply_filter)
+        lay.addWidget(self.tag_box)
+
+        lay.addWidget(QLabel("Typ:"))
+        self.type_box = QComboBox()
+        self.type_box.addItem("Alle")
+        for t in sorted({w["type"] for w in self.wallpapers}):
+            self.type_box.addItem(t)
+        self.type_box.currentTextChanged.connect(self.apply_filter)
+        lay.addWidget(self.type_box)
+
+        lay.addWidget(QLabel("Sortierung:"))
+        self.sort_box = QComboBox()
+        self.sort_box.addItems(["Titel", "Zuletzt hinzugefügt", "Größe", "Typ",
+                                "Favoriten zuerst", "Seitenverhältnis"])
+        self.sort_box.currentTextChanged.connect(self.populate_grid)
+        lay.addWidget(self.sort_box)
+
+        lay.addWidget(QLabel("Profil:"))
+        self.prof_box = QComboBox()
+        self.prof_box.setMinimumWidth(130)
+        self.prof_box.currentTextChanged.connect(self.on_profile_selected)
+        lay.addWidget(self.prof_box)
+        pb = QPushButton("Speichern")
+        pb.setToolTip("Aktuelle Einstellungen als Profil ablegen")
+        pb.clicked.connect(self.save_profile)
+        lay.addWidget(pb)
+        db = QPushButton("Löschen")
+        db.clicked.connect(self.delete_profile)
+        lay.addWidget(db)
+
+        lay.addWidget(QLabel("Größe:"))
+        self.thumb_slider = QSlider(Qt.Horizontal)
+        self.thumb_slider.setRange(140, 340)
+        self.thumb_slider.setValue(int(self.ui["thumb"]))
+        self.thumb_slider.setMaximumWidth(90)
+        self.thumb_slider.sliderReleased.connect(self.on_thumb_size)
+        lay.addWidget(self.thumb_slider)
+
+        btn = QPushButton("Workshop öffnen")
+        btn.setToolTip("Steam-Workshop im Browser oeffnen, um weitere Wallpaper zu abonnieren")
+        btn.clicked.connect(lambda: subprocess.Popen(["xdg-open", WORKSHOP_URL]))
+        lay.addWidget(btn)
+        return bar
+
+    def build_left(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        head = QLabel("Monitore")
+        head.setObjectName("Section")
+        v.addWidget(head)
+        self.mon_list = QListWidget()
+        self.mon_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        v.addWidget(self.mon_list, 1)
+
+        box = QGroupBox("Darstellung")
+        f = QFormLayout(box)
+        self.scaling_box = QComboBox()
+        self.scaling_box.addItems(SCALINGS)
+        self.scaling_box.currentTextChanged.connect(
+            lambda m: self.set_screen_field("scaling", m))
+        f.addRow("Skalierung:", self.scaling_box)
+        self.clamp_box = QComboBox()
+        self.clamp_box.addItems(CLAMPS)
+        self.clamp_box.currentTextChanged.connect(
+            lambda m: self.set_screen_field("clamp", m))
+        f.addRow("Kantenmodus:", self.clamp_box)
+        v.addWidget(box)
+
+        self.span_cb = QCheckBox("über alle Monitore spannen")
+        self.span_cb.setToolTip(
+            "Zieht ein Wallpaper über alle eingeschalteten Monitore\n"
+            "(--screen-span). Sinnvoll für Dual-Monitor-Wallpaper.\n"
+            "Braucht mindestens zwei aktive Monitore.")
+        self.span_cb.toggled.connect(self.on_span_toggle)
+        v.addWidget(self.span_cb)
+
+        self.assign_btn = QPushButton("Auswahl diesem Monitor zuweisen")
+        self.assign_btn.setObjectName("Primary")
+        self.assign_btn.clicked.connect(self.assign_selected)
+        v.addWidget(self.assign_btn)
+        clear = QPushButton("Monitor leeren")
+        clear.clicked.connect(self.clear_monitor)
+        v.addWidget(clear)
+
+        rot = QGroupBox("Diashow")
+        rv = QFormLayout(rot)
+        self.rot_on = QCheckBox("aktiv")
+        self.rot_on.setChecked(self.cfg["rotation"]["enabled"])
+        self.rot_on.toggled.connect(self.on_rot_toggle)
+        rv.addRow(self.rot_on)
+        self.rot_min = QSpinBox()
+        self.rot_min.setRange(1, 1440)
+        self.rot_min.setValue(int(self.cfg["rotation"]["minutes"]))
+        self.rot_min.setSuffix(" min")
+        rv.addRow("Wechsel alle:", self.rot_min)
+        self.rot_info = QLabel()
+        rv.addRow(self.rot_info)
+        pool_btn = QPushButton("Sichtbare Auswahl als Pool")
+        pool_btn.setToolTip("Alle aktuell gefilterten Wallpaper werden zum Diashow-Pool")
+        pool_btn.clicked.connect(self.set_pool)
+        rv.addRow(pool_btn)
+        v.addWidget(rot)
+        self.update_pool_info()
+        return w
+
+    def build_center(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.count_label = QLabel()
+        v.addWidget(self.count_label)
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListWidget.IconMode)
+        self.grid.setIconSize(self.thumb)
+        self.grid.setGridSize(QSize(self.thumb.width() + 26,
+                                    self.thumb.height() + 62))
+        self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self.grid_menu)
+        self.grid.setResizeMode(QListWidget.Adjust)
+        self.grid.setMovement(QListWidget.Static)
+        self.grid.setWordWrap(True)
+        self.grid.setSpacing(6)
+        self.grid.currentItemChanged.connect(lambda cur, _prev: self.show_details(cur))
+        self.grid.itemDoubleClicked.connect(lambda _i: self.assign_selected())
+        v.addWidget(self.grid, 1)
+        return w
+
+    def build_right(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.prev_label = QLabel()
+        self.prev_label.setAlignment(Qt.AlignCenter)
+        self.prev_label.setMinimumHeight(190)
+        self.prev_label.setFrameShape(QFrame.StyledPanel)
+        v.addWidget(self.prev_label)
+        self.det_title = QLabel()
+        self.det_title.setWordWrap(True)
+        v.addWidget(self.det_title)
+        self.det_meta = QLabel()
+        self.det_meta.setWordWrap(True)
+        self.det_meta.setTextFormat(Qt.RichText)
+        v.addWidget(self.det_meta)
+
+        tabs = QTabWidget()
+        self.desc = QTextEdit()
+        self.desc.setReadOnly(True)
+        tabs.addTab(self.desc, "Beschreibung")
+        self.props = PropertyEditor(self.on_property_changed)
+        tabs.addTab(self.props, "Einstellungen")
+        self.prop_hint = QLabel()
+        self.prop_hint.setWordWrap(True)
+        v.addWidget(tabs, 1)
+        v.addWidget(self.prop_hint)
+
+        prow = QHBoxLayout()
+        self.fav_btn = QPushButton("★ Favorit")
+        self.fav_btn.setCheckable(True)
+        self.fav_btn.clicked.connect(self.toggle_favorite)
+        prow.addWidget(self.fav_btn)
+        self.hide_btn = QPushButton("Verstecken")
+        self.hide_btn.setCheckable(True)
+        self.hide_btn.clicked.connect(self.toggle_hidden)
+        prow.addWidget(self.hide_btn)
+        self.reset_btn = QPushButton("Standardwerte")
+        self.reset_btn.setToolTip("Alle Property-Änderungen dieses Wallpapers verwerfen")
+        self.reset_btn.clicked.connect(self.reset_properties)
+        prow.addWidget(self.reset_btn)
+        v.addLayout(prow)
+
+        self.render_btn = QPushButton("Live-Vorschau rendern")
+        self.render_btn.setToolTip(
+            "Rendert das Wallpaper mit den aktuellen Einstellungen und Properties\n"
+            "im Seitenverhältnis des gewählten Monitors. Dabei blitzt kurz ein\n"
+            "Renderfenster auf; das ist normal.")
+        self.render_btn.clicked.connect(self.render_preview)
+        v.addWidget(self.render_btn)
+
+        self.open_btn = QPushButton("Workshop-Seite öffnen")
+        self.open_btn.clicked.connect(self.open_current_url)
+        v.addWidget(self.open_btn)
+        return w
+
+    def build_bottom(self):
+        bar = QFrame()
+        bar.setObjectName("Bar")
+        lay = QHBoxLayout(bar)
+        lay.addWidget(QLabel("FPS:"))
+        self.fps = QSpinBox()
+        self.fps.setRange(1, 240)
+        self.fps.setValue(int(self.cfg["fps"]))
+        self.fps.setMaximumWidth(70)
+        lay.addWidget(self.fps)
+
+        lay.addWidget(QLabel("Lautstärke:"))
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(int(self.cfg["volume"]))
+        self.vol.setMinimumWidth(120)
+        self.vol.setMaximumWidth(160)
+        self.vol_lbl = QLabel(str(self.cfg["volume"]))
+        self.vol.valueChanged.connect(lambda v: self.vol_lbl.setText(str(v)))
+        lay.addWidget(self.vol)
+        lay.addWidget(self.vol_lbl)
+
+        self.checks = {}
+        for key, text, tip in (
+            ("silent", "stumm", "Alle Wallpaper-Sounds abschalten"),
+            ("noautomute", "kein Auto-Mute", "Nicht stummschalten, wenn andere Apps Ton abspielen"),
+            ("disable_particles", "keine Partikel", "Partikeleffekte abschalten (spart GPU)"),
+            ("disable_mouse", "keine Maus", "Mausinteraktion des Wallpapers abschalten"),
+            ("disable_parallax", "kein Parallax", "Parallax-Effekt abschalten"),
+            ("pause_on_lock", "Sperre-Pause",
+             "Renderer einfrieren, solange der Bildschirm gesperrt ist.\n"
+             "Spart ~19 W GPU, waehrend niemand hinsieht."),
+            ("pause_on_maximized", "Maximiert-Pause",
+             "Renderer einfrieren, wenn auf jedem Monitor mit Wallpaper ein\n"
+             "maximiertes oder Vollbild-Fenster liegt - das Wallpaper ist dann\n"
+             "ohnehin unsichtbar."),
+            ("pause_on_fullscreen", "Vollbild-Pause",
+             "Renderer einfrieren, solange ein Fenster im Vollbild laeuft.\n"
+             "Eigene Erkennung per KWin-Skript, da KWin das dafuer noetige\n"
+             "Wayland-Protokoll nicht anbietet."),
+        ):
+            cb = QCheckBox(text)
+            cb.setToolTip(tip)
+            cb.setChecked(bool(self.cfg.get(key)))
+            self.checks[key] = cb
+            lay.addWidget(cb)
+
+        self.autostart = QCheckBox("Autostart")
+        self.autostart.setChecked(AUTOSTART.is_file())
+        self.autostart.toggled.connect(self.on_autostart)
+        lay.addWidget(self.autostart)
+        self.service_cb = QCheckBox("systemd-Dienst")
+        self.service_cb.setToolTip(
+            "Startet Renderer und Vollbild-Pause als systemd-Benutzerdienste.\n"
+            "Vorteil: systemd startet sie bei einem Absturz neu und bindet sie\n"
+            "an die Plasma-Sitzung. Ersetzt den Autostart-Eintrag.")
+        self.service_cb.setChecked(service_installed())
+        self.service_cb.toggled.connect(self.on_service_toggle)
+        lay.addWidget(self.service_cb)
+
+        lay.addStretch(1)
+        self.status = QLabel("…")
+        self.status.setObjectName("Pill")
+        lay.addWidget(self.status)
+        lay.addStretch(1)
+        for text, slot, default in (("Anwenden", self.on_apply, True),
+                                    ("Neustart", lambda: self.run_ctl("restart"), False),
+                                    ("Stop", lambda: self.run_ctl("stop"), False)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            b.setDefault(default)
+            if default:
+                b.setObjectName("Primary")
+            lay.addWidget(b)
+        return bar
+
+    # ---------------- Grid
+    def thumb_icon(self, path):
+        if path is None:
+            return QIcon()
+        r = QImageReader(str(path))
+        r.setAutoTransform(True)
+        img = r.read()
+        if img.isNull():
+            return QIcon()
+        return QIcon(QPixmap.fromImage(img).scaled(self.thumb, Qt.KeepAspectRatio,
+                                                   Qt.SmoothTransformation))
+
+    def populate_grid(self):
+        favs = set(self.cfg.get("favorites") or [])
+        keys = {
+            "Titel": lambda w: w["title"].lower(),
+            "Zuletzt hinzugefügt": lambda w: -w["mtime"],
+            "Größe": lambda w: -w["size"],
+            "Typ": lambda w: (w["type"], w["title"].lower()),
+            "Favoriten zuerst": lambda w: (w["id"] not in favs, w["title"].lower()),
+            "Seitenverhältnis": lambda w: (-w["aspect"], w["title"].lower()),
+        }
+        order = keys.get(self.sort_box.currentText(), keys["Titel"])
+        self.grid.clear()
+        for w in sorted(self.wallpapers, key=order):
+            label = w["title"] if len(w["title"]) <= 34 else w["title"][:33] + "…"
+            if w["id"] in favs:
+                label = "★ " + label
+            if w["id"] in set(self.cfg.get("hidden") or []):
+                label += "  (versteckt)"
+            if not w["ok"]:
+                label += "  ⚠ defekt"
+            it = QListWidgetItem(self.thumb_icon(w["preview"]), label)
+            it.setData(Qt.UserRole, w["id"])
+            mb = w["size"] / 1024 / 1024
+            it.setToolTip(f'{w["title"]}\nID {w["id"]} · {w["type"]} · {mb:.1f} MB'
+                          + (f'\nTags: {", ".join(w["tags"])}' if w["tags"] else "")
+                          + ("" if w["ok"] else "\n\nDefekt: keine Wallpaper-Datei."))
+            if not w["ok"]:
+                it.setFlags(it.flags() & ~Qt.ItemIsEnabled)
+            self.grid.addItem(it)
+        self.apply_filter()
+
+    def apply_filter(self):
+        needle = self.search.text().strip().lower()
+        tag = self.tag_box.currentText()
+        typ = self.type_box.currentText()
+        favs = set(self.cfg.get("favorites") or [])
+        hidden = set(self.cfg.get("hidden") or [])
+        mon_aspect = 0.0
+        name = self.current_monitor() if hasattr(self, "mon_list") else None
+        for n, mw, mh, _e in getattr(self, "mon_info", []):
+            if n == name and mh:
+                mon_aspect = mw / mh
+        shown = 0
+        for i in range(self.grid.count()):
+            it = self.grid.item(i)
+            w = self.by_id[it.data(Qt.UserRole)]
+            ok = True
+            if needle and needle not in (w["title"] + " " + w["description"]
+                                         + " " + w["id"]).lower():
+                ok = False
+            if tag != "Alle" and tag not in w["tags"]:
+                ok = False
+            if typ != "Alle" and w["type"] != typ:
+                ok = False
+            if self.fav_only.isChecked() and w["id"] not in favs:
+                ok = False
+            if w["id"] in hidden and not self.show_hidden.isChecked():
+                ok = False
+            if self.aspect_only.isChecked() and mon_aspect:
+                # Unbekannte Aufloesung gilt als "passt nicht", sonst waere der
+                # Filter wirkungslos - so steht es auch im Tooltip.
+                if not w["aspect"]:
+                    ok = False
+                elif abs(w["aspect"] - mon_aspect) / mon_aspect > 0.12:
+                    ok = False
+            it.setHidden(not ok)
+            shown += ok
+        self.count_label.setText(
+            f"<b>Wallpaper</b> — {shown} von {len(self.wallpapers)} "
+            f"(Doppelklick weist dem gewählten Monitor zu)")
+
+    def visible_ids(self):
+        return [self.grid.item(i).data(Qt.UserRole) for i in range(self.grid.count())
+                if not self.grid.item(i).isHidden()
+                and self.by_id[self.grid.item(i).data(Qt.UserRole)]["ok"]]
+
+    # ---------------- Monitore
+    def fill_monitors(self):
+        self.mon_list.clear()
+        self.mon_info = detect_monitors()
+        self.monitors = [m[0] for m in self.mon_info]
+        for _ in self.mon_info:
+            self.mon_list.addItem(QListWidgetItem(""))
+        for i in range(len(self.mon_info)):
+            self.refresh_monitor_row(i)
+
+    def refresh_monitor_row(self, idx):
+        name, w, h, enabled = self.mon_info[idx]
+        sc = self.cfg["screens"].get(name) or {}
+        wid = sc.get("id")
+        title = self.by_id.get(wid, {}).get("title", "— keins —") if wid else "— keins —"
+        it = self.mon_list.item(idx)
+        it.setText(f"{name}   {w}×{h}{'' if enabled else '   (aus)'}\n{title}")
+        if not enabled:
+            it.setForeground(QColor(150, 150, 150))
+            it.setToolTip("In den KDE-Anzeigeeinstellungen deaktiviert.\n"
+                          "Zuweisung wird gespeichert, beim Start aber übersprungen.")
+
+    def current_monitor(self):
+        i = self.mon_list.currentRow()
+        return self.monitors[i] if 0 <= i < len(self.monitors) else None
+
+    def on_monitor_selected(self, _idx):
+        name = self.current_monitor()
+        if not name:
+            return
+        sc = self.cfg["screens"].get(name) or {}
+        for box, key, default in ((self.scaling_box, "scaling", "fill"),
+                                  (self.clamp_box, "clamp", "clamp")):
+            box.blockSignals(True)
+            box.setCurrentText(sc.get(key) or default)
+            box.blockSignals(False)
+        wid = sc.get("id")
+        if wid:
+            for i in range(self.grid.count()):
+                if self.grid.item(i).data(Qt.UserRole) == wid:
+                    self.grid.setCurrentRow(i)
+                    break
+        self.show_details(self.grid.currentItem())
+
+    def set_screen_field(self, key, value):
+        name = self.current_monitor()
+        if name and name in self.cfg["screens"]:
+            self.cfg["screens"][name][key] = value
+
+    def assign_selected(self):
+        name = self.current_monitor()
+        it = self.grid.currentItem()
+        if not name or it is None:
+            return
+        wid = it.data(Qt.UserRole)
+        if not self.by_id[wid]["ok"]:
+            QMessageBox.warning(self, "Defektes Wallpaper",
+                                "Dieses Item enthält keine Wallpaper-Datei.")
+            return
+        old = self.cfg["screens"].get(name) or {}
+        self.cfg["screens"][name] = {
+            "id": wid,
+            "scaling": self.scaling_box.currentText(),
+            "clamp": self.clamp_box.currentText(),
+            "properties": old.get("properties", {}) if old.get("id") == wid else {},
+        }
+        self.refresh_monitor_row(self.mon_list.currentRow())
+        self.show_details(it)
+
+    def clear_monitor(self):
+        name = self.current_monitor()
+        if name and name in self.cfg["screens"]:
+            del self.cfg["screens"][name]
+            self.refresh_monitor_row(self.mon_list.currentRow())
+            self.show_details(self.grid.currentItem())
+
+    # ---------------- Detailbereich
+    def show_details(self, item):
+        if self.movie:
+            self.movie.stop()
+            self.movie = None
+        if item is None:
+            self.det_title.setText("")
+            self.det_meta.setText("")
+            self.desc.setPlainText("")
+            self.prev_label.setText("—")
+            self.props.build({}, {}, False)
+            self.prop_hint.setText("")
+            return
+        w = self.by_id[item.data(Qt.UserRole)]
+        self.det_title.setText(f'<b style="font-size:13pt">{w["title"]}</b>')
+        tags = ", ".join(w["tags"]) or "—"
+        if w["rw"]:
+            res = f'{w["rw"]}×{w["rh"]}'
+            mon = next(((mw, mh) for n, mw, mh, _e in self.mon_info
+                        if n == self.current_monitor()), None)
+            if mon and mon[1] and w["aspect"]:
+                diff = abs(w["aspect"] - mon[0] / mon[1]) / (mon[0] / mon[1])
+                res += (' <span style="color:#5ec98a">· passt genau</span>'
+                        if diff <= 0.03 else
+                        (' <span style="color:#c9a227">· wird beschnitten</span>'
+                         if diff > 0.12 else ""))
+        else:
+            res = '<span style="color:#9a9ab0">nicht ermittelbar</span>'
+        self.det_meta.setText(
+            f'ID {w["id"]}  ·  Typ <b>{w["type"]}</b>  ·  {w["size"]/1024/1024:.1f} MB'
+            f'<br>Auflösung: {res}'
+            f'<br>Tags: {tags}  ·  Properties: {len(w["props"])}')
+        self.desc.setPlainText(w["description"] or "(keine Beschreibung)")
+
+        if w["preview"] and w["preview"].suffix.lower() == ".gif":
+            self.movie = QMovie(str(w["preview"]))
+            self.movie.setScaledSize(QSize(400, 190 * 400 // max(1, 400)))
+            self.prev_label.setMovie(self.movie)
+            self.movie.start()
+        elif w["preview"]:
+            pm = QPixmap(str(w["preview"]))
+            self.prev_label.setPixmap(pm.scaled(QSize(400, 190), Qt.KeepAspectRatio,
+                                                Qt.SmoothTransformation))
+        else:
+            self.prev_label.setText("keine Vorschau")
+
+        name = self.current_monitor()
+        sc = self.cfg["screens"].get(name) or {}
+        assigned = sc.get("id") == w["id"]
+        self.props.build(w["props"], sc.get("properties", {}) if assigned else {},
+                         editable=assigned)
+        favs = set(self.cfg.get("favorites") or [])
+        hid = set(self.cfg.get("hidden") or [])
+        for btn, member in ((self.fav_btn, w["id"] in favs),
+                            (self.hide_btn, w["id"] in hid)):
+            btn.blockSignals(True)
+            btn.setChecked(member)
+            btn.blockSignals(False)
+        spans = self.cfg.get("spans") or []
+        self.span_cb.blockSignals(True)
+        self.span_cb.setChecked(bool(spans))
+        self.span_cb.blockSignals(False)
+        self.prop_hint.setText(
+            "" if assigned else
+            '<i style="color:#c9a227">Nur Vorschau — erst dem Monitor zuweisen, '
+            'um Einstellungen zu ändern.</i>')
+
+    def open_current_url(self):
+        it = self.grid.currentItem()
+        if it:
+            subprocess.Popen(["xdg-open", self.by_id[it.data(Qt.UserRole)]["url"]])
+
+    def on_property_changed(self, key, value):
+        name = self.current_monitor()
+        if not name or name not in self.cfg["screens"]:
+            return
+        self.cfg["screens"][name].setdefault("properties", {})[key] = value
+
+    # ---------------- Diashow
+    def on_rot_toggle(self, on):
+        self.cfg["rotation"]["enabled"] = on
+        self.update_pool_info()
+
+    def set_pool(self):
+        ids = self.visible_ids()
+        self.cfg["rotation"]["pool"] = ids
+        self.update_pool_info()
+        QMessageBox.information(self, "Diashow-Pool",
+                                f"{len(ids)} Wallpaper übernommen.")
+
+    def update_pool_info(self):
+        n = len(self.cfg["rotation"].get("pool") or [])
+        self.rot_info.setText(f"Pool: {n} Wallpaper"
+                              + ("" if n > 1 else "  (mind. 2 nötig)"))
+
+    # ---------------- Aktionen
+    def collect(self):
+        self.cfg["fps"] = self.fps.value()
+        self.cfg["volume"] = self.vol.value()
+        for key, cb in self.checks.items():
+            self.cfg[key] = cb.isChecked()
+        self.cfg["rotation"]["enabled"] = self.rot_on.isChecked()
+        self.cfg["rotation"]["minutes"] = self.rot_min.value()
+
+    def on_apply(self):
+        self.collect()
+        if not self.cfg["screens"]:
+            QMessageBox.warning(self, "Nichts ausgewählt",
+                                "Mindestens ein Monitor braucht ein Wallpaper.")
+            return
+        save_conf(self.cfg)
+        self.run_ctl("restart")
+
+    def run_ctl(self, action):
+        self.status.setText("… läuft an")
+        QApplication.processEvents()
+        try:
+            subprocess.run([str(CTL), action], timeout=120,
+                           capture_output=True, text=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", str(e))
+        self.refresh_status()
+
+    def on_autostart(self, checked):
+        if checked:
+            AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART.write_text(
+                "[Desktop Entry]\nType=Application\n"
+                "Name=Wallpaper Engine (linux-wallpaperengine)\n"
+                "Comment=Animierte Wallpaper-Engine-Hintergründe\n"
+                f'Exec=/bin/bash -c "sleep 5; exec {CTL} start"\n'
+                "Icon=preferences-desktop-wallpaper\nTerminal=false\n"
+                "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n",
+                encoding="utf-8")
+        elif AUTOSTART.is_file():
+            AUTOSTART.unlink()
+
+    # ---------------- Favoriten, Verstecken, Kontextmenü
+    def _toggle_in(self, key, wid, on):
+        lst = self.cfg.setdefault(key, [])
+        if on and wid not in lst:
+            lst.append(wid)
+        elif not on and wid in lst:
+            lst.remove(wid)
+        save_conf(self.cfg)
+        self.populate_grid()
+        self.select_id(wid)
+
+    def toggle_favorite(self):
+        it = self.grid.currentItem()
+        if it:
+            self._toggle_in("favorites", it.data(Qt.UserRole),
+                            self.fav_btn.isChecked())
+
+    def toggle_hidden(self):
+        it = self.grid.currentItem()
+        if it:
+            self._toggle_in("hidden", it.data(Qt.UserRole),
+                            self.hide_btn.isChecked())
+
+    def grid_menu(self, pos):
+        it = self.grid.itemAt(pos)
+        if it is None:
+            return
+        self.grid.setCurrentItem(it)
+        wid = it.data(Qt.UserRole)
+        favs = set(self.cfg.get("favorites") or [])
+        hidden = set(self.cfg.get("hidden") or [])
+        m = QMenu(self)
+        m.addAction("Diesem Monitor zuweisen").triggered.connect(self.assign_selected)
+        m.addAction("Live-Vorschau rendern").triggered.connect(self.render_preview)
+        m.addSeparator()
+        a_fav = m.addAction("Favorit")
+        a_fav.setCheckable(True)
+        a_fav.setChecked(wid in favs)
+        a_fav.triggered.connect(
+            lambda on, w=wid: self._toggle_in("favorites", w, on))
+        a_hid = m.addAction("Verstecken")
+        a_hid.setCheckable(True)
+        a_hid.setChecked(wid in hidden)
+        a_hid.triggered.connect(
+            lambda on, w=wid: self._toggle_in("hidden", w, on))
+        m.addSeparator()
+        m.addAction("Workshop-Seite öffnen").triggered.connect(self.open_current_url)
+        m.exec(self.grid.mapToGlobal(pos))
+
+    def select_id(self, wid):
+        for i in range(self.grid.count()):
+            if self.grid.item(i).data(Qt.UserRole) == wid:
+                self.grid.setCurrentRow(i)
+                self.grid.scrollToItem(self.grid.item(i))
+                return True
+        return False
+
+    def reset_properties(self):
+        name = self.current_monitor()
+        it = self.grid.currentItem()
+        if not name or it is None:
+            return
+        sc = self.cfg["screens"].get(name) or {}
+        if sc.get("id") != it.data(Qt.UserRole):
+            QMessageBox.information(
+                self, "Nicht zugewiesen",
+                "Standardwerte gelten für das dem Monitor zugewiesene Wallpaper.")
+            return
+        sc["properties"] = {}
+        self.show_details(it)
+        self.status.setText("Properties auf Standardwerte zurückgesetzt")
+
+    # ---------------- Span über mehrere Monitore
+    def on_span_toggle(self, on):
+        active = [n for n, _w, _h, en in self.mon_info if en]
+        if on:
+            if len(active) < 2:
+                self.span_cb.blockSignals(True)
+                self.span_cb.setChecked(False)
+                self.span_cb.blockSignals(False)
+                QMessageBox.information(
+                    self, "Zwei Monitore nötig",
+                    "Ein Span braucht mindestens zwei eingeschaltete Monitore.\n"
+                    f"Aktuell aktiv: {', '.join(active) or 'keiner'}.")
+                return
+            it = self.grid.currentItem()
+            if it is None:
+                return
+            self.cfg["spans"] = [{
+                "outputs": active, "id": it.data(Qt.UserRole),
+                "scaling": self.scaling_box.currentText(),
+                "clamp": self.clamp_box.currentText(), "properties": {},
+            }]
+            for n in active:
+                self.cfg["screens"].pop(n, None)
+        else:
+            self.cfg["spans"] = []
+        for i in range(len(self.mon_info)):
+            self.refresh_monitor_row(i)
+
+    # ---------------- systemd
+    def on_service_toggle(self, on):
+        action = "install-service" if on else "uninstall-service"
+        self.status.setText("Dienst wird eingerichtet …")
+        QApplication.processEvents()
+        r = subprocess.run([str(CTL), action], capture_output=True, text=True,
+                           timeout=120)
+        if r.returncode != 0:
+            QMessageBox.critical(self, "systemd", r.stderr.strip() or "Fehlgeschlagen")
+            self.service_cb.blockSignals(True)
+            self.service_cb.setChecked(service_installed())
+            self.service_cb.blockSignals(False)
+        else:
+            self.autostart.blockSignals(True)
+            self.autostart.setChecked(AUTOSTART.is_file())
+            self.autostart.blockSignals(False)
+        self.refresh_status()
+
+    # ---------------- Ansicht
+    def on_thumb_size(self):
+        val = self.thumb_slider.value()
+        self.thumb = QSize(val, int(val * 9 / 16))
+        self.grid.setIconSize(self.thumb)
+        self.grid.setGridSize(QSize(self.thumb.width() + 26,
+                                    self.thumb.height() + 62))
+        cur = self.grid.currentItem()
+        wid = cur.data(Qt.UserRole) if cur else None
+        self.populate_grid()
+        if wid:
+            self.select_id(wid)
+
+    # ---------------- Zustand merken
+    def restore_ui(self):
+        st = self.ui
+        if st.get("geometry"):
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(
+                    st["geometry"].encode("ascii")))
+            except Exception:
+                pass
+        for widget, key in ((self.search, "search"), (self.tag_box, "tag"),
+                            (self.type_box, "typ"), (self.sort_box, "sort")):
+            val = st.get(key) or ""
+            if not val:
+                continue
+            if isinstance(widget, QLineEdit):
+                widget.setText(val)
+            elif widget.findText(val) >= 0:
+                widget.setCurrentText(val)
+        row = int(st.get("monitor_row") or 0)
+        if 0 <= row < self.mon_list.count():
+            self.mon_list.setCurrentRow(row)
+        if st.get("last_id"):
+            self.select_id(st["last_id"])
+        tabs = self.findChildren(QTabWidget)
+        if tabs:
+            tabs[0].setCurrentIndex(int(st.get("tab") or 0))
+
+    def maybe_save_ui(self):
+        """Sichert den Zustand nur bei Aenderung - so ueberlebt er auch ein
+        hartes Beenden, ohne bei jedem Statusabruf zu schreiben."""
+        before = json.dumps(self.ui, sort_keys=True)
+        self.collect_ui(write=False)
+        after = json.dumps(self.ui, sort_keys=True)
+        if before != after:
+            save_ui(self.ui)
+
+    def collect_ui(self, write=True):
+        cur = self.grid.currentItem()
+        tabs = self.findChildren(QTabWidget)
+        self.ui.update({
+            "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "thumb": self.thumb_slider.value(),
+            "sort": self.sort_box.currentText(),
+            "tag": self.tag_box.currentText(),
+            "typ": self.type_box.currentText(),
+            "search": self.search.text(),
+            "monitor_row": self.mon_list.currentRow(),
+            "only_favs": self.fav_only.isChecked(),
+            "show_hidden": self.show_hidden.isChecked(),
+            "aspect_only": self.aspect_only.isChecked(),
+            "tab": tabs[0].currentIndex() if tabs else 0,
+            "last_id": cur.data(Qt.UserRole) if cur else "",
+        })
+        if write:
+            save_ui(self.ui)
+
+    # ---------------- Profile
+    def refresh_profiles(self):
+        self.prof_box.blockSignals(True)
+        self.prof_box.clear()
+        self.prof_box.addItem(PROFILE_PLACEHOLDER)
+        for name in sorted(self.cfg.get("profiles") or {}):
+            self.prof_box.addItem(name)
+        self.prof_box.blockSignals(False)
+
+    def on_profile_selected(self, name):
+        if not name or name == PROFILE_PLACEHOLDER:
+            return
+        saved = (self.cfg.get("profiles") or {}).get(name)
+        if not saved:
+            return
+        for key in DEFAULT_CONF:
+            if key != "profiles" and key in saved:
+                self.cfg[key] = json.loads(json.dumps(saved[key]))
+        self.apply_conf_to_ui()
+
+    def apply_conf_to_ui(self):
+        """Uebertraegt die Konfiguration zurueck in alle Bedienelemente."""
+        self.fps.setValue(int(self.cfg.get("fps", 30)))
+        self.vol.setValue(int(self.cfg.get("volume", 15)))
+        for key, cb in self.checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(bool(self.cfg.get(key)))
+            cb.blockSignals(False)
+        rot = self.cfg.get("rotation") or {}
+        self.rot_on.blockSignals(True)
+        self.rot_on.setChecked(bool(rot.get("enabled")))
+        self.rot_on.blockSignals(False)
+        self.rot_min.setValue(int(rot.get("minutes", 30)))
+        self.update_pool_info()
+        for i in range(len(self.mon_info)):
+            self.refresh_monitor_row(i)
+        self.on_monitor_selected(self.mon_list.currentRow())
+        if getattr(self, "act_pause", None):
+            self.act_pause.blockSignals(True)
+            self.act_pause.setChecked(bool(self.cfg.get("pause_on_fullscreen")))
+            self.act_pause.blockSignals(False)
+
+    def save_profile(self):
+        suggestion = self.prof_box.currentText()
+        if suggestion == PROFILE_PLACEHOLDER:
+            suggestion = ""
+        name, ok = QInputDialog.getText(self, "Profil speichern", "Name:",
+                                        text=suggestion)
+        name = (name or "").strip()
+        if not ok or not name or name == PROFILE_PLACEHOLDER:
+            return
+        self.collect()
+        snapshot = {k: json.loads(json.dumps(self.cfg[k]))
+                    for k in DEFAULT_CONF if k != "profiles" and k in self.cfg}
+        self.cfg.setdefault("profiles", {})[name] = snapshot
+        save_conf(self.cfg)
+        self.refresh_profiles()
+        self.prof_box.setCurrentText(name)
+        self.status.setText(f"Profil „{name}“ gespeichert")
+
+    def delete_profile(self):
+        name = self.prof_box.currentText()
+        if name == PROFILE_PLACEHOLDER or name not in (self.cfg.get("profiles") or {}):
+            return
+        if QMessageBox.question(self, "Profil löschen",
+                                f"Profil „{name}“ wirklich löschen?") != \
+                QMessageBox.StandardButton.Yes:
+            return
+        del self.cfg["profiles"][name]
+        save_conf(self.cfg)
+        self.refresh_profiles()
+
+    # ---------------- Live-Vorschau
+    def render_preview(self):
+        it = self.grid.currentItem()
+        if it is None or self.render_proc is not None:
+            return
+        wid = it.data(Qt.UserRole)
+        if not self.by_id[wid]["ok"]:
+            return
+        name = self.current_monitor()
+        geo = next(((mw, mh) for n, mw, mh, _e in self.mon_info if n == name),
+                   (1920, 1080))
+        aspect = (geo[0] / geo[1]) if geo[1] else 16 / 9
+        rw = 960
+        rh = max(120, int(round(rw / aspect)))
+        CACHE.mkdir(parents=True, exist_ok=True)
+        out = CACHE / f"preview_{wid}.png"
+        try:
+            out.unlink()
+        except OSError:
+            pass
+        sc = self.cfg["screens"].get(name) or {}
+        assigned = sc.get("id") == wid
+        scaling = (sc.get("scaling") if assigned
+                   else self.scaling_box.currentText()) or "fill"
+        args = ["--window", f"0x0x{rw}x{rh}", "--bg", wid, "--scaling", scaling,
+                "--silent", "--screenshot", str(out), "--screenshot-delay", "60"]
+        if assigned and sc.get("clamp"):
+            args += ["--clamp", sc["clamp"]]
+        for k, val in (sc.get("properties") or {} if assigned else {}).items():
+            args += ["--set-property", f"{k}={val}"]
+
+        self.render_target = out
+        self.render_btn.setEnabled(False)
+        self.render_btn.setText("rendert …")
+        self.render_proc = QProcess(self)
+        self.render_proc.finished.connect(self.render_finished)
+        self.render_proc.errorOccurred.connect(lambda _e: self.render_finished())
+        self.render_proc.start(str(RENDERER), args)
+        self.render_timeout = QTimer(self)
+        self.render_timeout.setSingleShot(True)
+        self.render_timeout.timeout.connect(self.kill_render)
+        self.render_timeout.start(120000)
+
+    def kill_render(self):
+        if self.render_proc is not None:
+            self.render_proc.kill()
+
+    def render_finished(self, *_):
+        if getattr(self, "render_timeout", None):
+            self.render_timeout.stop()
+        self.render_btn.setEnabled(True)
+        self.render_btn.setText("Live-Vorschau rendern")
+        self.render_proc = None
+        out = self.render_target
+        if out and out.is_file() and out.stat().st_size > 0:
+            if self.movie:
+                self.movie.stop()
+                self.movie = None
+            pm = QPixmap(str(out))
+            self.prev_label.setPixmap(pm.scaled(QSize(400, 190), Qt.KeepAspectRatio,
+                                                Qt.SmoothTransformation))
+            txt = self.det_meta.text().split("<br><i>")[0]
+            self.det_meta.setText(
+                txt + '<br><i>Live-Vorschau gerendert '
+                f'({pm.width()}×{pm.height()})</i>')
+        else:
+            QMessageBox.warning(
+                self, "Vorschau fehlgeschlagen",
+                "Der Renderer hat kein Bild geliefert. Web- und manche "
+                "Video-Wallpaper unterstützen den Schnappschuss nicht.")
+
+    # ---------------- Tray
+    def build_tray(self):
+        self.tray = None
+        self.act_pause = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QIcon.fromTheme("preferences-desktop-wallpaper")
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.SP_DesktopIcon)
+        self.tray = QSystemTrayIcon(icon, self)
+        menu = QMenu(self)
+        menu.addAction("Fenster zeigen").triggered.connect(self.show_normal)
+        menu.addSeparator()
+        menu.addAction("Start / Neustart").triggered.connect(
+            lambda: self.run_ctl("restart"))
+        menu.addAction("Stop").triggered.connect(lambda: self.run_ctl("stop"))
+        self.act_pause = menu.addAction("Vollbild-Pause")
+        self.act_pause.setCheckable(True)
+        self.act_pause.setChecked(bool(self.cfg.get("pause_on_fullscreen")))
+        self.act_pause.toggled.connect(self.on_tray_pause)
+        menu.addSeparator()
+        menu.addAction("Beenden").triggered.connect(self.quit_app)
+        self.tray_menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.setToolTip("Wallpaper Engine")
+        self.tray.show()
+
+    def quit_app(self):
+        self.collect_ui()
+        QApplication.quit()
+
+    def show_normal(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show_normal()
+
+    def on_tray_pause(self, checked):
+        cb = self.checks.get("pause_on_fullscreen")
+        if cb:
+            cb.setChecked(checked)
+        self.collect()
+        save_conf(self.cfg)
+        self.run_ctl("restart")
+
+    def closeEvent(self, event):
+        self.collect_ui()
+        if self.tray is not None:
+            event.ignore()
+            self.hide()
+            self.tray.showMessage("Wallpaper Engine",
+                                  "Läuft im Systemabschnitt weiter.",
+                                  QSystemTrayIcon.Information, 4000)
+        else:
+            super().closeEvent(event)
+
+    def refresh_status(self):
+        try:
+            out = subprocess.run([str(CTL), "status"], timeout=15,
+                                 capture_output=True, text=True).stdout
+        except Exception:
+            out = ""
+        first = out.splitlines()[0] if out else ""
+        if first.startswith("running"):
+            self.status.setText(
+                f'<span style="color:#3fb950">● läuft</span> — {first[8:]}')
+        else:
+            self.status.setText('<span style="color:#f85149">● gestoppt</span>')
+        if self.tray is not None:
+            self.tray.setToolTip("Wallpaper Engine — "
+                                 + (first or "gestoppt"))
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Wallpaper Engine")
+    app.setStyleSheet(build_qss())
+    app.setWindowIcon(QIcon.fromTheme("preferences-desktop-wallpaper"))
+    if not WORKSHOP.is_dir():
+        QMessageBox.critical(None, "Kein Workshop-Ordner", f"Fehlt:\n{WORKSHOP}")
+        return 1
+    w = Window()
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
